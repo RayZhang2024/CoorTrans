@@ -1,6 +1,9 @@
+import base64
 import io
+import json
 import os
 import tempfile
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -8,23 +11,71 @@ import plotly.graph_objects as go
 import streamlit as st
 from stl import mesh
 
+from components.plane_picker import plane_picker
+
+
+POINT_COLUMNS = ["Label", "X", "Y", "Z"]
+COPLANAR_THRESHOLD_MM = 1.0
+RMS_WARN_MM = 0.1
+MAX_WARN_MM = 0.2
+PLANE_PICKER_BUILD = os.path.join(
+    os.path.dirname(__file__), "components", "plane_picker", "frontend", "build"
+)
+
 
 st.set_page_config(page_title="CoorTrans", layout="wide")
 st.title("CoorTrans")
 
-uploaded_file = st.sidebar.file_uploader("Choose an STL file", type=["stl"])
-st.sidebar.caption("Upload a binary or ASCII STL file to preview the model.")
 
-model_transparency = st.sidebar.slider(
-    "Model transparency (0=opaque, 1=transparent)", 0.0, 1.0, 0.0, 0.05
-)
-model_color = st.sidebar.color_picker("Model color", "#4c78a8")
-show_symbols = st.sidebar.checkbox("Show symbols", value=True)
-symbol_size = st.sidebar.slider("Symbol size", 2, 20, 6)
-symbol_color = st.sidebar.color_picker("Symbol color", "#e45756")
+def empty_points_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=POINT_COLUMNS)
 
-if "points" not in st.session_state:
-    st.session_state.points = []
+
+def init_state() -> None:
+    defaults = {
+        "feature_sample_df": empty_points_df(),
+        "feature_instrument_df": empty_points_df(),
+        "target_sample_df": empty_points_df(),
+        "stl_bytes": None,
+        "stl_name": None,
+        "handedness_sample": "right",
+        "handedness_instrument": "right",
+        "axis_flip": "none",
+        "scale_value": 1.0,
+        "auto_scale": False,
+        "model_color": "#4c78a8",
+        "model_transparency": 0.0,
+        "show_symbols": True,
+        "symbol_size": 6,
+        "symbol_color": "#e45756",
+        "view_frame": "Sample",
+        "axis_flip_suggest_msg": "",
+        "axis_flip_suggest_level": "",
+        "plane_mode": "Three Points",
+        "plane_points": [(0.0, 0.0, 0.0)] * 3,
+        "plane_point": (0.0, 0.0, 0.0),
+        "plane_normal": (0.0, 0.0, 1.0),
+        "plane_axis": "XY",
+        "plane_offset": 0.0,
+        "plane_enabled": False,
+        "plane_view_normal": False,
+        "plane_snap_to_curve": True,
+        "click_add_to": "Target Points (Sample)",
+        "last_plane_pick_id": None,
+        "plane_pick_uv": [],
+        "plane_signature": "",
+        "plane_pick_rev": 0,
+        "plane_show_3d_points_live": False,
+        "last_plane_commit_id": None,
+        "apply_plane_camera_once": False,
+        "viewer_camera_rev": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+init_state()
 
 
 def _read_table(file_bytes: bytes, extension: str, header) -> pd.DataFrame:
@@ -40,118 +91,466 @@ def _read_table(file_bytes: bytes, extension: str, header) -> pd.DataFrame:
         )
 
 
-def _extract_points(df: pd.DataFrame) -> list[tuple[float, float, float]]:
+def _extract_points_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or df.shape[1] < 3:
-        return []
-    names = [str(col).strip().lower() for col in df.columns]
-    if {"x", "y", "z"}.issubset(names):
-        col_map = {name: idx for idx, name in enumerate(names)}
-        cols = [col_map["x"], col_map["y"], col_map["z"]]
-        coords_df = df.iloc[:, cols]
+        return empty_points_df()
+    cols = [str(col).strip().lower() for col in df.columns]
+    label_col = None
+    for candidate in ["label", "name", "id"]:
+        if candidate in cols:
+            label_col = df.columns[cols.index(candidate)]
+            break
+    if {"x", "y", "z"}.issubset(cols):
+        x_col = df.columns[cols.index("x")]
+        y_col = df.columns[cols.index("y")]
+        z_col = df.columns[cols.index("z")]
     else:
-        coords_df = df.iloc[:, :3]
-    coords_df = coords_df.apply(pd.to_numeric, errors="coerce").dropna(how="any")
-    return [tuple(row) for row in coords_df.to_numpy()]
+        x_col, y_col, z_col = df.columns[:3]
+        if label_col is None and df.shape[1] >= 4:
+            label_col = df.columns[3]
+    out = pd.DataFrame(
+        {
+            "Label": df[label_col] if label_col is not None else "",
+            "X": pd.to_numeric(df[x_col], errors="coerce"),
+            "Y": pd.to_numeric(df[y_col], errors="coerce"),
+            "Z": pd.to_numeric(df[z_col], errors="coerce"),
+        }
+    )
+    out = out.dropna(subset=["X", "Y", "Z"]).reset_index(drop=True)
+    if out.empty:
+        return empty_points_df()
+    out["Label"] = out["Label"].fillna("").astype(str)
+    return out
 
 
-def load_coordinates(uploaded) -> list[tuple[float, float, float]]:
+def load_points_file(uploaded) -> pd.DataFrame:
     file_bytes = uploaded.getvalue()
     extension = os.path.splitext(uploaded.name)[1].lower()
     df_with_header = _read_table(file_bytes, extension, header=0)
-    points_with_header = _extract_points(df_with_header)
+    points_with_header = _extract_points_df(df_with_header)
     names = [str(col).strip().lower() for col in df_with_header.columns]
     has_xyz_header = {"x", "y", "z"}.issubset(names)
     if has_xyz_header:
         return points_with_header
     df_no_header = _read_table(file_bytes, extension, header=None)
-    points_no_header = _extract_points(df_no_header)
+    points_no_header = _extract_points_df(df_no_header)
     if len(points_no_header) > len(points_with_header):
         return points_no_header
     return points_with_header
 
-with st.sidebar.expander("Coordinate symbols", expanded=True):
-    if st.session_state.points:
-        coords_df = pd.DataFrame(st.session_state.points, columns=["X", "Y", "Z"])
+
+def ensure_point_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return empty_points_df()
+    df = df.copy()
+    lower_cols = {col.lower(): col for col in df.columns}
+    if "label" in lower_cols and "Label" not in df.columns:
+        df["Label"] = df[lower_cols["label"]]
+    if "x" in lower_cols and "X" not in df.columns:
+        df["X"] = df[lower_cols["x"]]
+    if "y" in lower_cols and "Y" not in df.columns:
+        df["Y"] = df[lower_cols["y"]]
+    if "z" in lower_cols and "Z" not in df.columns:
+        df["Z"] = df[lower_cols["z"]]
+    for col in POINT_COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col == "Label" else np.nan
+    df = df[POINT_COLUMNS]
+    df["Label"] = df["Label"].fillna("").astype(str)
+    return df
+
+
+def clean_points_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = ensure_point_columns(df)
+    if df.empty:
+        return df
+    df["X"] = pd.to_numeric(df["X"], errors="coerce")
+    df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
+    df["Z"] = pd.to_numeric(df["Z"], errors="coerce")
+    df = df.dropna(subset=["X", "Y", "Z"]).reset_index(drop=True)
+    return df
+
+
+def df_to_points(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    if df is None or df.empty:
+        return np.zeros((0, 3)), []
+    df = clean_points_df(df)
+    if df.empty:
+        return np.zeros((0, 3)), []
+    points = df[["X", "Y", "Z"]].to_numpy(dtype=float)
+    labels = df["Label"].fillna("").astype(str).tolist()
+    return points, labels
+
+
+def points_to_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = clean_points_df(df)
+    if df.empty:
+        return df
+    export_df = df.copy()
+    export_df.insert(0, "id", range(1, len(export_df) + 1))
+    export_df.columns = ["id", "label", "x", "y", "z"]
+    return export_df
+
+
+def export_points(df: pd.DataFrame, file_format: str):
+    export_df = points_to_export_df(df)
+    if file_format == "XLSX":
+        buffer = io.BytesIO()
+        export_df.to_excel(buffer, index=False)
+        data = buffer.getvalue()
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ext = ".xlsx"
+    elif file_format == "TXT":
+        data = export_df.to_csv(index=False, sep="\t")
+        mime = "text/plain"
+        ext = ".txt"
     else:
-        coords_df = pd.DataFrame([[0.0, 0.0, 0.0]], columns=["X", "Y", "Z"])
-    coords_df.insert(0, "#", range(1, len(coords_df) + 1))
+        data = export_df.to_csv(index=False)
+        mime = "text/csv"
+        ext = ".csv"
+    return data, mime, ext
 
-    edited_df = st.data_editor(
-        coords_df,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
-            "X": st.column_config.NumberColumn("X", format="%.3f"),
-            "Y": st.column_config.NumberColumn("Y", format="%.3f"),
-            "Z": st.column_config.NumberColumn("Z", format="%.3f"),
-        },
-        key="coords_table",
+
+def normalize_vector(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm == 0:
+        return vec
+    return vec / norm
+
+
+def plane_from_inputs() -> Tuple[np.ndarray, np.ndarray]:
+    mode = st.session_state["plane_mode"]
+    if mode == "Three Points":
+        p1, p2, p3 = [np.array(p) for p in st.session_state["plane_points"]]
+        n = np.cross(p2 - p1, p3 - p1)
+        return p1, normalize_vector(n)
+    if mode == "Point + Normal":
+        p0 = np.array(st.session_state["plane_point"])
+        n = np.array(st.session_state["plane_normal"])
+        return p0, normalize_vector(n)
+    axis = st.session_state["plane_axis"]
+    offset = float(st.session_state["plane_offset"])
+    if axis == "XY":
+        return np.array([0.0, 0.0, offset]), np.array([0.0, 0.0, 1.0])
+    if axis == "YZ":
+        return np.array([offset, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])
+    return np.array([0.0, offset, 0.0]), np.array([0.0, 1.0, 0.0])
+
+
+def triangle_plane_intersection(
+    tri: np.ndarray, p0: np.ndarray, n: np.ndarray, eps: float = 1e-6
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    d = (tri - p0) @ n
+    if np.all(d > eps) or np.all(d < -eps):
+        return []
+    if np.all(np.abs(d) <= eps):
+        return []
+    points = []
+    edges = [(0, 1), (1, 2), (2, 0)]
+    for i, j in edges:
+        d1, d2 = d[i], d[j]
+        if abs(d1) <= eps and abs(d2) <= eps:
+            continue
+        if d1 * d2 < -eps**2:
+            t = d1 / (d1 - d2)
+            points.append(tri[i] + t * (tri[j] - tri[i]))
+        elif abs(d1) <= eps:
+            points.append(tri[i])
+        elif abs(d2) <= eps:
+            points.append(tri[j])
+    if len(points) < 2:
+        return []
+    if len(points) > 2:
+        unique = []
+        for p in points:
+            if not any(np.allclose(p, q, atol=1e-6) for q in unique):
+                unique.append(p)
+        points = unique
+    if len(points) >= 2:
+        return [(points[0], points[1])]
+    return []
+
+
+def mesh_plane_intersections(
+    stl_mesh: mesh.Mesh, p0: np.ndarray, n: np.ndarray
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    segments: List[Tuple[np.ndarray, np.ndarray]] = []
+    for tri in stl_mesh.vectors:
+        segments.extend(triangle_plane_intersection(tri, p0, n))
+    return segments
+
+
+def segments_to_trace_data(
+    segments: List[Tuple[np.ndarray, np.ndarray]]
+) -> Tuple[List[float], List[float], List[float]]:
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+    for a, b in segments:
+        xs.extend([a[0], b[0], None])
+        ys.extend([a[1], b[1], None])
+        zs.extend([a[2], b[2], None])
+    return xs, ys, zs
+
+
+def plane_basis(normal: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    n = normalize_vector(normal)
+    if abs(n[0]) < 0.9:
+        ref = np.array([1.0, 0.0, 0.0])
+    else:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = normalize_vector(np.cross(n, ref))
+    v = normalize_vector(np.cross(n, u))
+    return u, v
+
+
+def plane_uv_bounds(
+    p0: np.ndarray, n: np.ndarray, bounds_min: np.ndarray, bounds_max: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, float]:
+    u, v = plane_basis(n)
+    corners = np.array(
+        [
+            [bounds_min[0], bounds_min[1], bounds_min[2]],
+            [bounds_min[0], bounds_min[1], bounds_max[2]],
+            [bounds_min[0], bounds_max[1], bounds_min[2]],
+            [bounds_min[0], bounds_max[1], bounds_max[2]],
+            [bounds_max[0], bounds_min[1], bounds_min[2]],
+            [bounds_max[0], bounds_min[1], bounds_max[2]],
+            [bounds_max[0], bounds_max[1], bounds_min[2]],
+            [bounds_max[0], bounds_max[1], bounds_max[2]],
+        ]
     )
+    rel = corners - p0
+    us = rel @ u
+    vs = rel @ v
+    return u, v, float(us.min()), float(us.max()), float(vs.min()), float(vs.max())
 
-    points_df = edited_df.drop(columns=["#"], errors="ignore")
-    points_df = points_df.apply(pd.to_numeric, errors="coerce").dropna(how="any")
-    st.session_state.points = [tuple(row) for row in points_df.to_numpy()]
 
-    if st.session_state.points:
-        export_df = pd.DataFrame(st.session_state.points, columns=["X", "Y", "Z"])
-        file_format = st.selectbox("Save format", ["CSV", "TXT", "XLSX"])
-        file_name = st.text_input("Filename", value="coordinates")
-        base_name = file_name.strip() or "coordinates"
-        ext_map = {"CSV": ".csv", "TXT": ".txt", "XLSX": ".xlsx"}
-        if os.path.splitext(base_name)[1].lower() in ext_map.values():
-            base_name = os.path.splitext(base_name)[0]
-        final_name = f"{base_name}{ext_map[file_format]}"
+def sample_segment_points(
+    segments: List[Tuple[np.ndarray, np.ndarray]], max_points: int = 2000
+) -> np.ndarray:
+    if not segments:
+        return np.zeros((0, 3))
+    pts = []
+    for a, b in segments:
+        pts.append(a)
+        pts.append(b)
+        mid = (a + b) / 2.0
+        pts.append(mid)
+    pts_arr = np.array(pts)
+    if pts_arr.shape[0] > max_points:
+        idx = np.linspace(0, pts_arr.shape[0] - 1, max_points).astype(int)
+        pts_arr = pts_arr[idx]
+    return pts_arr
 
-        if file_format == "XLSX":
-            buffer = io.BytesIO()
-            export_df.to_excel(buffer, index=False, header=False)
-            data = buffer.getvalue()
-            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        elif file_format == "TXT":
-            data = export_df.to_csv(index=False, header=False, sep="\t")
-            mime = "text/plain"
+
+def nearest_point_on_segments(
+    point: np.ndarray, segments: List[Tuple[np.ndarray, np.ndarray]]
+) -> Tuple[np.ndarray, float]:
+    best_point = None
+    best_dist = None
+    for a, b in segments:
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        if denom == 0:
+            proj = a
         else:
-            data = export_df.to_csv(index=False, header=False)
-            mime = "text/csv"
+            t = float(np.dot(point - a, ab) / denom)
+            t = max(0.0, min(1.0, t))
+            proj = a + t * ab
+        dist = float(np.linalg.norm(point - proj))
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_point = proj
+    if best_point is None:
+        return point, float("inf")
+    return best_point, best_dist
 
-        st.download_button(
-            "Save coordinates",
-            data=data,
-            file_name=final_name,
-            mime=mime,
+
+def project_segments_uv(
+    segments: List[Tuple[np.ndarray, np.ndarray]],
+    p0: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+) -> List[List[List[float]]]:
+    out: List[List[List[float]]] = []
+    for a, b in segments:
+        a_uv = [float((a - p0) @ u), float((a - p0) @ v)]
+        b_uv = [float((b - p0) @ u), float((b - p0) @ v)]
+        out.append([a_uv, b_uv])
+    return out
+
+
+def point_to_uv(point: np.ndarray, p0: np.ndarray, u: np.ndarray, v: np.ndarray) -> List[float]:
+    rel = point - p0
+    return [float(rel @ u), float(rel @ v)]
+
+def is_coplanar(points: np.ndarray, threshold: float) -> bool:
+    if points.shape[0] < 4:
+        return True
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+    if np.allclose(centered, 0):
+        return True
+    _, _, v_t = np.linalg.svd(centered, full_matrices=False)
+    normal = v_t[-1]
+    distances = np.abs(centered @ normal)
+    return float(np.max(distances)) <= threshold
+
+
+def kabsch_rotation(P: np.ndarray, Q: np.ndarray, enforce_proper: bool) -> np.ndarray:
+    H = P.T @ Q
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if enforce_proper and np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    return R
+
+
+def solve_transform(
+    P: np.ndarray,
+    Q: np.ndarray,
+    scale_value: float,
+    auto_scale: bool,
+    axis_flip: str,
+    enforce_proper: bool,
+) -> Dict[str, np.ndarray]:
+    flip_vector = np.array([1.0, 1.0, 1.0])
+    if axis_flip == "X":
+        flip_vector = np.array([-1.0, 1.0, 1.0])
+    elif axis_flip == "Y":
+        flip_vector = np.array([1.0, -1.0, 1.0])
+    elif axis_flip == "Z":
+        flip_vector = np.array([1.0, 1.0, -1.0])
+    P_adj = P * flip_vector
+    Pc = P_adj.mean(axis=0)
+    Qc = Q.mean(axis=0)
+    P0 = P_adj - Pc
+    Q0 = Q - Qc
+    R = kabsch_rotation(P0, Q0, enforce_proper=enforce_proper)
+    if auto_scale:
+        denom = np.sum(P0 ** 2)
+        if denom <= 0:
+            s = scale_value
+        else:
+            s = float(np.sum(Q0 * (P0 @ R.T)) / denom)
+    else:
+        s = scale_value
+    t = Qc - s * (R @ Pc)
+    R_eff = R.copy()
+    R_eff[:, 0] *= flip_vector[0]
+    R_eff[:, 1] *= flip_vector[1]
+    R_eff[:, 2] *= flip_vector[2]
+    return {
+        "scale": s,
+        "rotation": R,
+        "rotation_effective": R_eff,
+        "translation": t,
+        "axis_flip": axis_flip,
+    }
+
+
+def apply_transform(points: np.ndarray, transform: Dict[str, np.ndarray]) -> np.ndarray:
+    if points.size == 0:
+        return points
+    R_eff = transform["rotation_effective"]
+    s = transform["scale"]
+    t = transform["translation"]
+    return (points @ (s * R_eff).T) + t
+
+
+def compute_errors(
+    P: np.ndarray, Q: np.ndarray, transform: Dict[str, np.ndarray]
+) -> Tuple[float, float, np.ndarray]:
+    pred = apply_transform(P, transform)
+    residuals = Q - pred
+    norms = np.linalg.norm(residuals, axis=1)
+    rms = float(np.sqrt(np.mean(norms ** 2))) if norms.size else 0.0
+    max_err = float(np.max(norms)) if norms.size else 0.0
+    return rms, max_err, residuals
+
+
+def build_matrix(transform: Dict[str, np.ndarray]) -> np.ndarray:
+    M = np.eye(4)
+    M[:3, :3] = transform["scale"] * transform["rotation_effective"]
+    M[:3, 3] = transform["translation"]
+    return M
+
+
+def matrix_to_csv(matrix: np.ndarray) -> str:
+    df = pd.DataFrame(matrix)
+    df.columns = [f"m0{i}" for i in range(4)]
+    df.index = [f"r{i}" for i in range(4)]
+    return df.to_csv(index=False)
+
+
+def mesh_from_bytes(stl_bytes: bytes) -> mesh.Mesh:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as tmp_file:
+        tmp_file.write(stl_bytes)
+        tmp_path = tmp_file.name
+    try:
+        return mesh.Mesh.from_file(tmp_path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def transform_mesh(stl_mesh: mesh.Mesh, transform: Dict[str, np.ndarray]) -> mesh.Mesh:
+    new_mesh = mesh.Mesh(np.copy(stl_mesh.data))
+    pts = new_mesh.vectors.reshape(-1, 3)
+    pts_transformed = apply_transform(pts, transform)
+    new_mesh.vectors = pts_transformed.reshape(new_mesh.vectors.shape)
+    return new_mesh
+
+
+def format_labels(labels: List[str], points: np.ndarray) -> List[str]:
+    out = []
+    for idx, label in enumerate(labels):
+        x, y, z = points[idx]
+        if label:
+            out.append(f"{label} ({x:.2f}, {y:.2f}, {z:.2f})")
+        else:
+            out.append(f"({x:.2f}, {y:.2f}, {z:.2f})")
+    return out
+
+
+def add_points_trace(
+    fig: go.Figure,
+    points: np.ndarray,
+    labels: List[str],
+    name: str,
+    color: str,
+    size: int,
+    show_labels: bool,
+) -> None:
+    if points.size == 0:
+        return
+    text = format_labels(labels, points) if show_labels else None
+    fig.add_trace(
+        go.Scatter3d(
+            x=points[:, 0],
+            y=points[:, 1],
+            z=points[:, 2],
+            mode="markers+text" if show_labels else "markers",
+            text=text,
+            textposition="top center",
+            marker=dict(size=size, color=color),
+            name=name,
         )
-
-with st.sidebar.expander("Upload coordinates file", expanded=False):
-    coords_file = st.file_uploader(
-        "Choose a coordinates file", type=["csv", "txt", "xlsx"]
     )
-    replace_coords = st.checkbox("Replace existing coordinates", value=False)
-    load_coords = st.button("Load coordinates", disabled=coords_file is None)
-    if load_coords and coords_file is not None:
-        try:
-            loaded_points = load_coordinates(coords_file)
-            if not loaded_points:
-                st.warning("No valid coordinates found in the file.")
-            else:
-                if replace_coords:
-                    st.session_state.points = loaded_points
-                else:
-                    st.session_state.points.extend(loaded_points)
-                st.success(f"Loaded {len(loaded_points)} coordinates.")
-        except Exception as exc:
-            st.error(f"Failed to load coordinates: {exc}")
 
 
-def render_stl(
+def render_scene(
     stl_mesh: mesh.Mesh,
     *,
     opacity: float,
     color: str,
-    points: list[tuple[float, float, float]],
-    show_symbols: bool,
+    point_traces: List[Tuple[np.ndarray, List[str], str, str]],
+    show_labels: bool,
     symbol_size: int,
-    symbol_color: str,
+    intersection_segments: List[Tuple[np.ndarray, np.ndarray]] | None = None,
+    camera: Dict | None = None,
 ) -> None:
     vectors = stl_mesh.vectors
     x = vectors[:, :, 0].ravel()
@@ -173,53 +572,801 @@ def render_stl(
                 color=color,
                 opacity=opacity,
                 flatshading=True,
+                name="Model",
             )
         ]
     )
-    if show_symbols and points:
-        px, py, pz = zip(*points)
-        labels = [f"({px[i]:.3f}, {py[i]:.3f}, {pz[i]:.3f})" for i in range(len(points))]
+    if intersection_segments:
+        xs, ys, zs = segments_to_trace_data(intersection_segments)
         fig.add_trace(
             go.Scatter3d(
-                x=px,
-                y=py,
-                z=pz,
-                mode="markers+text",
-                text=labels,
-                textposition="top center",
-                marker=dict(size=symbol_size, color=symbol_color),
-                name="Coordinates",
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="lines",
+                line=dict(color="#ff7f0e", width=4),
+                name="Plane Intersection",
             )
         )
+    for points, labels, name, trace_color in point_traces:
+        add_points_trace(
+            fig,
+            points,
+            labels,
+            name=name,
+            color=trace_color,
+            size=symbol_size,
+            show_labels=show_labels,
+        )
+    uirev = f"coortrans-{st.session_state.get('viewer_camera_rev', 0)}"
     fig.update_layout(
-        scene=dict(aspectmode="data", uirevision="coortrans"),
+        scene=dict(aspectmode="data", uirevision=uirev, camera=camera),
         margin=dict(l=0, r=0, t=20, b=0),
-        showlegend=False,
-        uirevision="coortrans",
+        showlegend=True,
+        uirevision=uirev,
     )
     st.plotly_chart(fig, use_container_width=True, key="stl_viewer")
 
 
-if uploaded_file is None:
-    st.info("Upload an STL file from the sidebar to view it here.")
-else:
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as tmp_file:
-            tmp_file.write(uploaded_file.getbuffer())
-            tmp_path = tmp_file.name
-        stl_mesh = mesh.Mesh.from_file(tmp_path)
-        render_stl(
-            stl_mesh,
-            opacity=1.0 - model_transparency,
-            color=model_color,
-            points=st.session_state.points,
-            show_symbols=show_symbols,
-            symbol_size=symbol_size,
-            symbol_color=symbol_color,
+def points_editor(
+    title: str,
+    key: str,
+    help_text: str,
+    import_key: str,
+    export_key: str,
+) -> None:
+    st.subheader(title)
+    st.caption(help_text)
+
+    df = st.session_state[key]
+    display_df = df.copy()
+    if display_df.empty:
+        display_df = pd.DataFrame(columns=POINT_COLUMNS)
+    display_df.insert(0, "#", range(1, len(display_df) + 1))
+
+    edited_df = st.data_editor(
+        display_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
+            "Label": st.column_config.TextColumn("Label"),
+            "X": st.column_config.NumberColumn("X", format="%.3f"),
+            "Y": st.column_config.NumberColumn("Y", format="%.3f"),
+            "Z": st.column_config.NumberColumn("Z", format="%.3f"),
+        },
+        key=f"{key}_editor",
+    )
+
+    edited_df = edited_df.drop(columns=["#"], errors="ignore")
+    st.session_state[key] = ensure_point_columns(edited_df)
+
+    with st.expander("Import / Export", expanded=False):
+        coords_file = st.file_uploader(
+            "Choose a coordinates file", type=["csv", "txt", "xlsx"], key=import_key
         )
+        replace_coords = st.checkbox(
+            "Replace existing coordinates", value=False, key=f"{import_key}_replace"
+        )
+        load_coords = st.button(
+            "Load coordinates", disabled=coords_file is None, key=f"{import_key}_load"
+        )
+        if load_coords and coords_file is not None:
+            try:
+                loaded_df = load_points_file(coords_file)
+                if loaded_df.empty:
+                    st.warning("No valid coordinates found in the file.")
+                else:
+                    if replace_coords:
+                        st.session_state[key] = loaded_df
+                    else:
+                        st.session_state[key] = pd.concat(
+                            [st.session_state[key], loaded_df], ignore_index=True
+                        )
+                    st.success(f"Loaded {len(loaded_df)} coordinates.")
+            except Exception as exc:
+                st.error(f"Failed to load coordinates: {exc}")
+
+        export_df = st.session_state[key]
+        if not export_df.empty:
+            file_format = st.selectbox(
+                "Save format", ["CSV", "TXT", "XLSX"], key=f"{export_key}_format"
+            )
+            file_name = st.text_input(
+                "Filename", value=key, key=f"{export_key}_name"
+            )
+            base_name = file_name.strip() or key
+            if os.path.splitext(base_name)[1].lower() in {".csv", ".txt", ".xlsx"}:
+                base_name = os.path.splitext(base_name)[0]
+            data, mime, ext = export_points(export_df, file_format)
+            st.download_button(
+                "Save coordinates",
+                data=data,
+                file_name=f"{base_name}{ext}",
+                mime=mime,
+                key=f"{export_key}_download",
+            )
+
+def build_project_payload(transform: Dict[str, np.ndarray] | None, errors=None) -> Dict:
+    stl_block = None
+    if st.session_state["stl_bytes"]:
+        stl_block = {
+            "filename": st.session_state.get("stl_name") or "model.stl",
+            "encoding": "base64",
+            "data": base64.b64encode(st.session_state["stl_bytes"]).decode("ascii"),
+        }
+    payload = {
+        "version": "1.0",
+        "units": "mm",
+        "stl_embedded": stl_block,
+        "handedness": {
+            "sample": st.session_state["handedness_sample"],
+            "instrument": st.session_state["handedness_instrument"],
+            "axis_flip": st.session_state["axis_flip"],
+        },
+        "points": {
+            "feature_sample": points_to_export_df(
+                st.session_state["feature_sample_df"]
+            ).to_dict(orient="records"),
+            "feature_instrument": points_to_export_df(
+                st.session_state["feature_instrument_df"]
+            ).to_dict(orient="records"),
+            "target_sample": points_to_export_df(
+                st.session_state["target_sample_df"]
+            ).to_dict(orient="records"),
+        },
+        "transform": None,
+        "settings": {
+            "model_color": st.session_state["model_color"],
+            "model_opacity": 1.0 - st.session_state["model_transparency"],
+            "symbol_size": st.session_state["symbol_size"],
+            "symbol_color": st.session_state["symbol_color"],
+        },
+    }
+    if transform is not None:
+        payload["transform"] = {
+            "scale": float(transform["scale"]),
+            "rotation": transform["rotation"].tolist(),
+            "translation": transform["translation"].tolist(),
+            "matrix_4x4": build_matrix(transform).tolist(),
+            "fit_error": errors or {},
+        }
+    return payload
+
+
+def load_project(payload: Dict) -> None:
+    stl_block = payload.get("stl_embedded") or None
+    if stl_block and stl_block.get("encoding") == "base64":
+        st.session_state["stl_name"] = stl_block.get("filename", "model.stl")
+        st.session_state["stl_bytes"] = base64.b64decode(stl_block.get("data", ""))
+    else:
+        st.session_state["stl_name"] = None
+        st.session_state["stl_bytes"] = None
+
+    handed = payload.get("handedness", {})
+    st.session_state["handedness_sample"] = handed.get("sample", "right")
+    st.session_state["handedness_instrument"] = handed.get("instrument", "right")
+    st.session_state["axis_flip"] = handed.get("axis_flip", "none")
+
+    points = payload.get("points", {})
+    st.session_state["feature_sample_df"] = ensure_point_columns(
+        pd.DataFrame(points.get("feature_sample", []))
+    )
+    st.session_state["feature_instrument_df"] = ensure_point_columns(
+        pd.DataFrame(points.get("feature_instrument", []))
+    )
+    st.session_state["target_sample_df"] = ensure_point_columns(
+        pd.DataFrame(points.get("target_sample", []))
+    )
+
+    transform = payload.get("transform") or {}
+    st.session_state["scale_value"] = float(transform.get("scale", 1.0))
+
+    settings = payload.get("settings", {})
+    st.session_state["model_color"] = settings.get("model_color", "#4c78a8")
+    model_opacity = settings.get("model_opacity", 1.0)
+    st.session_state["model_transparency"] = 1.0 - float(model_opacity)
+    st.session_state["symbol_size"] = int(settings.get("symbol_size", 6))
+    st.session_state["symbol_color"] = settings.get("symbol_color", "#e45756")
+
+
+project_download_slot = None
+with st.sidebar.expander("Project", expanded=False):
+    project_file = st.file_uploader("Load project", type=["json"], key="project_file")
+    load_project_btn = st.button("Load project", disabled=project_file is None)
+    if load_project_btn and project_file is not None:
+        try:
+            payload = json.loads(project_file.getvalue().decode("utf-8"))
+            load_project(payload)
+            st.success("Project loaded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Failed to load project: {exc}")
+
+    project_download_slot = st.empty()
+
+uploaded_file = st.sidebar.file_uploader("Choose an STL file", type=["stl"])
+if uploaded_file is not None:
+    st.session_state["stl_bytes"] = uploaded_file.getvalue()
+    st.session_state["stl_name"] = uploaded_file.name
+
+st.sidebar.caption("Upload a binary or ASCII STL file to preview the model.")
+
+st.sidebar.slider(
+    "Model transparency (0=opaque, 1=transparent)",
+    0.0,
+    1.0,
+    st.session_state["model_transparency"],
+    0.05,
+    key="model_transparency",
+)
+st.sidebar.color_picker(
+    "Model color", st.session_state["model_color"], key="model_color"
+)
+
+st.sidebar.checkbox(
+    "Show point labels", value=st.session_state["show_symbols"], key="show_symbols"
+)
+st.sidebar.slider(
+    "Symbol size", 2, 20, st.session_state["symbol_size"], key="symbol_size"
+)
+st.sidebar.color_picker(
+    "Symbol color", st.session_state["symbol_color"], key="symbol_color"
+)
+
+st.sidebar.radio(
+    "View frame",
+    ["Sample", "Instrument"],
+    index=0 if st.session_state["view_frame"] == "Sample" else 1,
+    key="view_frame",
+)
+with st.sidebar.expander("Transform", expanded=True):
+    st.number_input(
+        "Scale (unitless)",
+        value=float(st.session_state["scale_value"]),
+        step=0.0001,
+        format="%.6f",
+        key="scale_value",
+    )
+    st.checkbox(
+        "Auto-estimate scale", value=st.session_state["auto_scale"], key="auto_scale"
+    )
+
+    st.selectbox(
+        "Sample handedness",
+        ["right", "left"],
+        index=0 if st.session_state["handedness_sample"] == "right" else 1,
+        key="handedness_sample",
+    )
+    st.selectbox(
+        "Instrument handedness",
+        ["right", "left"],
+        index=0 if st.session_state["handedness_instrument"] == "right" else 1,
+        key="handedness_instrument",
+    )
+
+    axis_flip_needed = (
+        st.session_state["handedness_sample"]
+        != st.session_state["handedness_instrument"]
+    )
+    if axis_flip_needed:
+        st.info("Handedness differs. Choose an axis flip.")
+        st.selectbox(
+            "Axis flip",
+            ["X", "Y", "Z"],
+            index=["X", "Y", "Z"].index(
+                st.session_state["axis_flip"]
+                if st.session_state["axis_flip"] in {"X", "Y", "Z"}
+                else "X"
+            ),
+            key="axis_flip",
+        )
+        def suggest_axis_flip() -> None:
+            P, _ = df_to_points(st.session_state["feature_sample_df"])
+            Q, _ = df_to_points(st.session_state["feature_instrument_df"])
+            best_axis = None
+            best_rms = None
+            for axis in ["X", "Y", "Z"]:
+                if P.shape[0] == 0 or Q.shape[0] == 0:
+                    continue
+                if P.shape[0] != Q.shape[0]:
+                    continue
+                if P.shape[0] < 4:
+                    continue
+                result = solve_transform(
+                    P,
+                    Q,
+                    scale_value=st.session_state["scale_value"],
+                    auto_scale=st.session_state["auto_scale"],
+                    axis_flip=axis,
+                    enforce_proper=True,
+                )
+                rms, _, _ = compute_errors(P, Q, result)
+                if best_rms is None or rms < best_rms:
+                    best_rms = rms
+                    best_axis = axis
+            if best_axis:
+                st.session_state["axis_flip"] = best_axis
+                st.session_state["axis_flip_suggest_level"] = "success"
+                st.session_state[
+                    "axis_flip_suggest_msg"
+                ] = f"Auto-suggested axis flip: {best_axis}"
+            else:
+                st.session_state["axis_flip_suggest_level"] = "warning"
+                st.session_state[
+                    "axis_flip_suggest_msg"
+                ] = "Not enough points to auto-suggest an axis flip."
+
+        st.button("Auto-suggest flip", on_click=suggest_axis_flip)
+        if st.session_state["axis_flip_suggest_msg"]:
+            if st.session_state["axis_flip_suggest_level"] == "success":
+                st.success(st.session_state["axis_flip_suggest_msg"])
+            else:
+                st.warning(st.session_state["axis_flip_suggest_msg"])
+    else:
+        st.session_state["axis_flip"] = "none"
+        st.session_state["axis_flip_suggest_msg"] = ""
+        st.session_state["axis_flip_suggest_level"] = ""
+        st.caption("Handedness matches; no axis flip required.")
+
+with st.sidebar.expander("Plane Selection", expanded=False):
+    prev_plane_view_normal = st.session_state["plane_view_normal"]
+    st.checkbox(
+        "Enable plane selection",
+        value=st.session_state["plane_enabled"],
+        key="plane_enabled",
+    )
+    st.selectbox(
+        "Plane definition",
+        ["Three Points", "Point + Normal", "Point + Axis"],
+        index=["Three Points", "Point + Normal", "Point + Axis"].index(
+            st.session_state["plane_mode"]
+        ),
+        key="plane_mode",
+    )
+    st.checkbox(
+        "View along plane normal",
+        value=st.session_state["plane_view_normal"],
+        key="plane_view_normal",
+    )
+    if st.session_state["plane_view_normal"] != prev_plane_view_normal:
+        st.session_state["apply_plane_camera_once"] = True
+        st.session_state["viewer_camera_rev"] += 1
+    st.checkbox(
+        "Snap clicks to intersection curve",
+        value=st.session_state["plane_snap_to_curve"],
+        key="plane_snap_to_curve",
+    )
+    st.checkbox(
+        "Show picked points in 3D while picking (slower)",
+        value=st.session_state["plane_show_3d_points_live"],
+        key="plane_show_3d_points_live",
+    )
+    st.selectbox(
+        "Add clicked points to",
+        ["Target Points (Sample)", "Feature Points (Sample)"],
+        index=0
+        if st.session_state["click_add_to"] == "Target Points (Sample)"
+        else 1,
+        key="click_add_to",
+    )
+    if st.button("Clear Plane Markers"):
+        st.session_state["plane_pick_uv"] = []
+        st.session_state["plane_pick_rev"] += 1
+
+    if st.session_state["plane_mode"] == "Three Points":
+        pts = list(st.session_state["plane_points"])
+        p1 = st.text_input("P1 (x,y,z)", value=",".join(map(str, pts[0])))
+        p2 = st.text_input("P2 (x,y,z)", value=",".join(map(str, pts[1])))
+        p3 = st.text_input("P3 (x,y,z)", value=",".join(map(str, pts[2])))
+        def parse_point(text: str) -> Tuple[float, float, float]:
+            parts = [float(x.strip()) for x in text.split(",")]
+            if len(parts) != 3:
+                raise ValueError("Need three values")
+            return parts[0], parts[1], parts[2]
+        try:
+            st.session_state["plane_points"] = [
+                parse_point(p1),
+                parse_point(p2),
+                parse_point(p3),
+            ]
+        except Exception:
+            st.warning("Enter points as x,y,z.")
+    elif st.session_state["plane_mode"] == "Point + Normal":
+        p0 = st.text_input(
+            "Point (x,y,z)", value=",".join(map(str, st.session_state["plane_point"]))
+        )
+        n0 = st.text_input(
+            "Normal (nx,ny,nz)",
+            value=",".join(map(str, st.session_state["plane_normal"])),
+        )
+        def parse_point(text: str) -> Tuple[float, float, float]:
+            parts = [float(x.strip()) for x in text.split(",")]
+            if len(parts) != 3:
+                raise ValueError("Need three values")
+            return parts[0], parts[1], parts[2]
+        try:
+            st.session_state["plane_point"] = parse_point(p0)
+            st.session_state["plane_normal"] = parse_point(n0)
+        except Exception:
+            st.warning("Enter values as x,y,z.")
+    else:
+        st.selectbox(
+            "Axis plane",
+            ["XY", "YZ", "XZ"],
+            index=["XY", "YZ", "XZ"].index(st.session_state["plane_axis"]),
+            key="plane_axis",
+        )
+        st.number_input(
+            "Offset (mm)",
+            value=float(st.session_state["plane_offset"]),
+            step=0.1,
+            format="%.3f",
+            key="plane_offset",
+        )
+
+left_col, right_col = st.columns([1, 1])
+
+with left_col:
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "Target Points (Sample)",
+            "Feature Points (Sample)",
+            "Feature Points (Instrument)",
+        ]
+    )
+    with tab1:
+        points_editor(
+            "Target Points (Sample)",
+            "target_sample_df",
+            "Coordinates inside/outside the sample, in sample frame.",
+            import_key="target_sample",
+            export_key="target_sample",
+        )
+    with tab2:
+        points_editor(
+            "Feature Points (Sample)",
+            "feature_sample_df",
+            "Use 4 to 6 sharp exterior features. Row order must match instrument points.",
+            import_key="feature_sample",
+            export_key="feature_sample",
+        )
+    with tab3:
+        points_editor(
+            "Feature Points (Instrument)",
+            "feature_instrument_df",
+            "Measured with theodolite in instrument frame. Row order must match sample features.",
+            import_key="feature_instrument",
+            export_key="feature_instrument",
+        )
+
+transform_result = None
+transform_errors = None
+transform_warnings = []
+
+P_feat, labels_feat = df_to_points(st.session_state["feature_sample_df"])
+Q_feat, labels_instr = df_to_points(st.session_state["feature_instrument_df"])
+
+if P_feat.shape[0] != Q_feat.shape[0]:
+    if P_feat.shape[0] > 0 or Q_feat.shape[0] > 0:
+        transform_warnings.append("Feature point counts do not match.")
+
+point_count = P_feat.shape[0]
+if point_count and not (4 <= point_count <= 6):
+    transform_warnings.append("Provide 4 to 6 feature points for solving.")
+
+if point_count >= 4:
+    if is_coplanar(P_feat, COPLANAR_THRESHOLD_MM):
+        transform_warnings.append(
+            "Sample feature points are coplanar within 1.0 mm; mirror ambiguity may exist."
+        )
+    if is_coplanar(Q_feat, COPLANAR_THRESHOLD_MM):
+        transform_warnings.append(
+            "Instrument feature points are coplanar within 1.0 mm; mirror ambiguity may exist."
+        )
+
+if (
+    point_count >= 4
+    and point_count <= 6
+    and P_feat.shape[0] == Q_feat.shape[0]
+    and P_feat.shape[0] > 0
+):
+    transform_result = solve_transform(
+        P_feat,
+        Q_feat,
+        scale_value=float(st.session_state["scale_value"]),
+        auto_scale=st.session_state["auto_scale"],
+        axis_flip=st.session_state["axis_flip"],
+        enforce_proper=True,
+    )
+    rms, max_err, residuals = compute_errors(P_feat, Q_feat, transform_result)
+    transform_errors = {
+        "rms_mm": rms,
+        "max_mm": max_err,
+    }
+    if rms > RMS_WARN_MM:
+        transform_warnings.append(f"RMS error {rms:.4f} mm exceeds 0.1 mm.")
+    if max_err > MAX_WARN_MM:
+        transform_warnings.append(f"Max error {max_err:.4f} mm exceeds 0.2 mm.")
+
+with right_col:
+    st.subheader("Transform Summary")
+    if transform_result is None:
+        st.info("Provide 4 to 6 matching feature points to compute the transform.")
+    else:
+        st.write(f"Scale: {transform_result['scale']:.6f}")
+        st.write(f"Axis flip: {transform_result['axis_flip']}")
+        st.write("Rotation (3x3):")
+        st.dataframe(
+            pd.DataFrame(transform_result["rotation"], columns=["x", "y", "z"]),
+            use_container_width=True,
+        )
+        st.write("Translation (mm):")
+        st.dataframe(
+            pd.DataFrame(
+                [transform_result["translation"]], columns=["x", "y", "z"]
+            ),
+            use_container_width=True,
+        )
+        if transform_errors:
+            st.write(
+                f"RMS error: {transform_errors['rms_mm']:.4f} mm | "
+                f"Max error: {transform_errors['max_mm']:.4f} mm"
+            )
+
+        matrix = build_matrix(transform_result)
+        st.write("Transform matrix (4x4):")
+        st.dataframe(pd.DataFrame(matrix), use_container_width=True)
+        st.download_button(
+            "Download transform matrix CSV",
+            data=matrix_to_csv(matrix),
+            file_name="transform_matrix.csv",
+            mime="text/csv",
+        )
+
+    if transform_warnings:
+        for msg in transform_warnings:
+            st.warning(msg)
+
+if project_download_slot is not None:
+    project_payload = build_project_payload(transform_result, transform_errors)
+    project_download_slot.download_button(
+        "Download project",
+        data=json.dumps(project_payload, indent=2),
+        file_name="coortrans_project.json",
+        mime="application/json",
+    )
+st.subheader("Viewer")
+
+if st.session_state["stl_bytes"] is None:
+    st.info("Upload an STL file to view it here.")
+else:
+    try:
+        stl_mesh = mesh_from_bytes(st.session_state["stl_bytes"])
+        intersection_segments = None
+        plane_params = None
+        plane_origin = None
+        plane_normal = None
+        camera = None
+        if st.session_state["plane_enabled"] and st.session_state["view_frame"] == "Sample":
+            p0, n = plane_from_inputs()
+            if np.linalg.norm(n) == 0:
+                st.warning("Plane normal is zero; cannot compute intersection.")
+            else:
+                plane_origin = p0
+                plane_normal = n
+                intersection_segments = mesh_plane_intersections(stl_mesh, p0, n)
+                vectors = stl_mesh.vectors.reshape(-1, 3)
+                bounds_min = vectors.min(axis=0)
+                bounds_max = vectors.max(axis=0)
+                plane_params = plane_uv_bounds(p0, n, bounds_min, bounds_max)
+                signature = (
+                    f"{st.session_state['plane_mode']}|"
+                    f"{p0[0]:.6f},{p0[1]:.6f},{p0[2]:.6f}|"
+                    f"{n[0]:.6f},{n[1]:.6f},{n[2]:.6f}"
+                )
+                if st.session_state["plane_signature"] != signature:
+                    st.session_state["plane_signature"] = signature
+                    st.session_state["plane_pick_uv"] = []
+                    st.session_state["plane_pick_rev"] += 1
+                if (
+                    st.session_state["plane_view_normal"]
+                    and st.session_state["apply_plane_camera_once"]
+                ):
+                    diag = float(np.linalg.norm(bounds_max - bounds_min)) or 1.0
+                    eye = normalize_vector(n) * (0.6 * diag)
+                    camera = dict(
+                        eye=dict(x=eye[0], y=eye[1], z=eye[2]),
+                        center=dict(x=0.0, y=0.0, z=0.0),
+                        up=dict(x=0.0, y=0.0, z=1.0),
+                        projection=dict(type="orthographic"),
+                    )
+                    st.session_state["apply_plane_camera_once"] = False
+        point_traces = []
+        if st.session_state["view_frame"] == "Sample":
+            target_points, target_labels = df_to_points(
+                st.session_state["target_sample_df"]
+            )
+            feature_points, feature_labels = df_to_points(
+                st.session_state["feature_sample_df"]
+            )
+            show_live_points = (
+                not st.session_state["plane_enabled"]
+                or st.session_state["plane_show_3d_points_live"]
+            )
+            if show_live_points:
+                if target_points.size:
+                    point_traces.append(
+                        (target_points, target_labels, "Target Points", "#2ca02c")
+                    )
+                if feature_points.size:
+                    point_traces.append(
+                        (feature_points, feature_labels, "Feature Points", "#d62728")
+                    )
+            render_scene(
+                stl_mesh,
+                opacity=1.0 - st.session_state["model_transparency"],
+                color=st.session_state["model_color"],
+                point_traces=point_traces,
+                show_labels=st.session_state["show_symbols"],
+                symbol_size=st.session_state["symbol_size"],
+                intersection_segments=intersection_segments,
+                camera=camera,
+            )
+            if (
+                st.session_state["plane_enabled"]
+                and plane_params is not None
+                and plane_origin is not None
+                and plane_normal is not None
+            ):
+                if not os.path.isdir(PLANE_PICKER_BUILD):
+                    st.warning(
+                        "Plane picker component is not built yet. Run npm install && npm run build in components/plane_picker/frontend."
+                    )
+                else:
+                    u_axis, v_axis, umin, umax, vmin, vmax = plane_params
+                    segments_uv = (
+                        project_segments_uv(
+                            intersection_segments, plane_origin, u_axis, v_axis
+                        )
+                        if intersection_segments
+                        else []
+                    )
+                    st.subheader("Plane Picker")
+                    pick = plane_picker(
+                        p0=plane_origin.tolist(),
+                        u=u_axis.tolist(),
+                        v=v_axis.tolist(),
+                        umin=umin,
+                        umax=umax,
+                        vmin=vmin,
+                        vmax=vmax,
+                        segments=segments_uv,
+                        picks=st.session_state["plane_pick_uv"],
+                        picks_rev=st.session_state["plane_pick_rev"],
+                        width=1000,
+                        height=520,
+                        key="plane_picker",
+                    )
+                    if pick and pick.get("commit_id") != st.session_state["last_plane_commit_id"]:
+                        st.session_state["last_plane_commit_id"] = pick.get("commit_id")
+                        uv_points = pick.get("picks", [])
+                        if uv_points:
+                            add_to = st.session_state["click_add_to"]
+                            df_key = (
+                                "target_sample_df"
+                                if add_to == "Target Points (Sample)"
+                                else "feature_sample_df"
+                            )
+                            df = clean_points_df(st.session_state[df_key].copy())
+                            rows = []
+                            for uv in uv_points:
+                                uu = float(uv[0])
+                                vv = float(uv[1])
+                                picked = plane_origin + u_axis * uu + v_axis * vv
+                                if (
+                                    st.session_state["plane_snap_to_curve"]
+                                    and intersection_segments
+                                ):
+                                    picked, _ = nearest_point_on_segments(
+                                        picked, intersection_segments
+                                    )
+                                st.session_state["plane_pick_uv"].append(
+                                    point_to_uv(picked, plane_origin, u_axis, v_axis)
+                                )
+                                rows.append(
+                                    {"Label": "", "X": picked[0], "Y": picked[1], "Z": picked[2]}
+                                )
+                            st.session_state["plane_pick_rev"] += 1
+                            if rows:
+                                df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+                                st.session_state[df_key] = df
+        else:
+            if transform_result is None:
+                st.warning("Transform not available; showing sample frame instead.")
+                target_points, target_labels = df_to_points(
+                    st.session_state["target_sample_df"]
+                )
+                feature_points, feature_labels = df_to_points(
+                    st.session_state["feature_sample_df"]
+                )
+                if target_points.size:
+                    point_traces.append(
+                        (target_points, target_labels, "Target Points", "#2ca02c")
+                    )
+                if feature_points.size:
+                    point_traces.append(
+                        (feature_points, feature_labels, "Feature Points", "#d62728")
+                    )
+                render_scene(
+                    stl_mesh,
+                    opacity=1.0 - st.session_state["model_transparency"],
+                    color=st.session_state["model_color"],
+                    point_traces=point_traces,
+                    show_labels=st.session_state["show_symbols"],
+                    symbol_size=st.session_state["symbol_size"],
+                    intersection_segments=intersection_segments,
+                    camera=camera,
+                )
+            else:
+                transformed_mesh = transform_mesh(stl_mesh, transform_result)
+                target_points, target_labels = df_to_points(
+                    st.session_state["target_sample_df"]
+                )
+                transformed_targets = apply_transform(target_points, transform_result)
+                feature_instr_points, feature_instr_labels = df_to_points(
+                    st.session_state["feature_instrument_df"]
+                )
+                if transformed_targets.size:
+                    point_traces.append(
+                        (
+                            transformed_targets,
+                            target_labels,
+                            "Target Points (Instrument)",
+                            "#2ca02c",
+                        )
+                    )
+                if feature_instr_points.size:
+                    point_traces.append(
+                        (
+                            feature_instr_points,
+                            feature_instr_labels,
+                            "Feature Points (Instrument)",
+                            "#d62728",
+                        )
+                    )
+                render_scene(
+                    transformed_mesh,
+                    opacity=1.0 - st.session_state["model_transparency"],
+                    color=st.session_state["model_color"],
+                    point_traces=point_traces,
+                    show_labels=st.session_state["show_symbols"],
+                    symbol_size=st.session_state["symbol_size"],
+                    intersection_segments=None,
+                    camera=None,
+                )
     except Exception as exc:
         st.error(f"Failed to load STL file: {exc}")
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+
+st.subheader("Transformed Target Points (Instrument)")
+if transform_result is None:
+    st.info("Compute a transform to view transformed target points.")
+else:
+    target_points, target_labels = df_to_points(st.session_state["target_sample_df"])
+    transformed_targets = apply_transform(target_points, transform_result)
+    if transformed_targets.size == 0:
+        st.info("No target points to transform.")
+    else:
+        out_df = pd.DataFrame(transformed_targets, columns=["X", "Y", "Z"])
+        out_df.insert(0, "Label", target_labels)
+        out_df.insert(0, "#", range(1, len(out_df) + 1))
+        st.dataframe(out_df, use_container_width=True)
+        export_df = out_df.drop(columns=["#"], errors="ignore")
+        export_df.columns = ["Label", "X", "Y", "Z"]
+        data, mime, ext = export_points(export_df, "CSV")
+        st.download_button(
+            "Download transformed points CSV",
+            data=data,
+            file_name="target_points_instrument.csv",
+            mime=mime,
+        )
