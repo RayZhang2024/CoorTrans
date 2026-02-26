@@ -20,6 +20,10 @@ body {
   touch-action: none;
 }
 
+.canvas.dragging {
+  cursor: grabbing;
+}
+
 .caption {
   margin-top: 6px;
   font-size: 12px;

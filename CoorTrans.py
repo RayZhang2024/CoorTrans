@@ -18,6 +18,8 @@ POINT_COLUMNS = ["Label", "X", "Y", "Z"]
 COPLANAR_THRESHOLD_MM = 1.0
 RMS_WARN_MM = 0.1
 MAX_WARN_MM = 0.2
+STAGE_DIMS_MM = (500.0, 500.0, 100.0)  # width (X), length (Y), height (Z)
+AXIS_SNAP_DIRECTIONS = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"}
 PLANE_PICKER_BUILD = os.path.join(
     os.path.dirname(__file__), "components", "plane_picker", "frontend", "build"
 )
@@ -44,9 +46,9 @@ def init_state() -> None:
         "scale_value": 1.0,
         "auto_scale": False,
         "model_color": "#4c78a8",
-        "model_transparency": 0.0,
+        "model_transparency": 0.7,
         "show_symbols": True,
-        "symbol_size": 6,
+        "symbol_size": 2,
         "symbol_color": "#e45756",
         "view_frame": "Sample",
         "axis_flip_suggest_msg": "",
@@ -66,9 +68,30 @@ def init_state() -> None:
         "plane_signature": "",
         "plane_pick_rev": 0,
         "plane_show_3d_points_live": False,
+        "plane_preview_uv": [],
+        "last_plane_preview_id": None,
         "last_plane_commit_id": None,
         "apply_plane_camera_once": False,
         "viewer_camera_rev": 0,
+        "viewer_camera_override": None,
+        "viewer_camera_override_direction": None,
+        "instrument_pose_source": "Theodolite fit",
+        "beam_show": True,
+        "beam_size_y_mm": 4.0,
+        "beam_size_z_mm": 4.0,
+        "stage_show": True,
+        "stage_tx": 0.0,
+        "stage_ty": 0.0,
+        "stage_tz": 0.0,
+        "stage_rx": 0.0,
+        "stage_ry": 0.0,
+        "stage_rz": 0.0,
+        "sample_mount_tx": 0.0,
+        "sample_mount_ty": 0.0,
+        "sample_mount_tz": 0.0,
+        "sample_mount_rx": 0.0,
+        "sample_mount_ry": 0.0,
+        "sample_mount_rz": 0.0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -216,6 +239,183 @@ def normalize_vector(vec: np.ndarray) -> np.ndarray:
     if norm == 0:
         return vec
     return vec / norm
+
+
+def rotation_matrix_xyz_deg(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    rx, ry, rz = np.deg2rad([rx_deg, ry_deg, rz_deg])
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    r_x = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    r_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    r_z = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return r_z @ r_y @ r_x
+
+
+def pose_matrix_xyz(
+    tx: float, ty: float, tz: float, rx_deg: float, ry_deg: float, rz_deg: float
+) -> np.ndarray:
+    mat = np.eye(4)
+    mat[:3, :3] = rotation_matrix_xyz_deg(rx_deg, ry_deg, rz_deg)
+    mat[:3, 3] = [tx, ty, tz]
+    return mat
+
+
+def apply_pose_matrix(points: np.ndarray, mat: np.ndarray) -> np.ndarray:
+    if points.size == 0:
+        return points
+    r = mat[:3, :3]
+    t = mat[:3, 3]
+    return (points @ r.T) + t
+
+
+def transform_vectors_by_matrix(vectors: np.ndarray, mat: np.ndarray) -> np.ndarray:
+    if vectors.size == 0:
+        return vectors
+    pts = vectors.reshape(-1, 3)
+    pts_t = apply_pose_matrix(pts, mat)
+    return pts_t.reshape(vectors.shape)
+
+
+def transform_mesh_by_matrix(stl_mesh: mesh.Mesh, mat: np.ndarray) -> mesh.Mesh:
+    new_mesh = mesh.Mesh(np.copy(stl_mesh.data))
+    new_mesh.vectors = transform_vectors_by_matrix(new_mesh.vectors, mat)
+    return new_mesh
+
+
+def matrix_to_rigid_transform(mat: np.ndarray) -> Dict[str, np.ndarray]:
+    r = mat[:3, :3].copy()
+    t = mat[:3, 3].copy()
+    return {
+        "scale": 1.0,
+        "rotation": r.copy(),
+        "rotation_effective": r,
+        "translation": t,
+        "axis_flip": "none",
+    }
+
+
+def cuboid_vectors(width: float, length: float, height: float) -> np.ndarray:
+    # Stage local frame convention: top surface at z=0, body extends down to z=-height.
+    x0, x1 = -width / 2.0, width / 2.0
+    y0, y1 = -length / 2.0, length / 2.0
+    z0, z1 = -height, 0.0
+    vertices = np.array(
+        [
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ],
+        dtype=float,
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],  # bottom
+            [4, 6, 5],
+            [4, 7, 6],  # top
+            [0, 4, 5],
+            [0, 5, 1],  # side y0
+            [1, 5, 6],
+            [1, 6, 2],  # side x1
+            [2, 6, 7],
+            [2, 7, 3],  # side y1
+            [3, 7, 4],
+            [3, 4, 0],  # side x0
+        ],
+        dtype=int,
+    )
+    return vertices[faces]
+
+
+def beam_cuboid_vectors(
+    x_start: float, x_end: float, size_y: float, size_z: float
+) -> np.ndarray:
+    x0, x1 = sorted([float(x_start), float(x_end)])
+    half_y = max(float(size_y), 0.1) / 2.0
+    half_z = max(float(size_z), 0.1) / 2.0
+    y0, y1 = -half_y, half_y
+    z0, z1 = -half_z, half_z
+    vertices = np.array(
+        [
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ],
+        dtype=float,
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 4, 5],
+            [0, 5, 1],
+            [1, 5, 6],
+            [1, 6, 2],
+            [2, 6, 7],
+            [2, 7, 3],
+            [3, 7, 4],
+            [3, 4, 0],
+        ],
+        dtype=int,
+    )
+    return vertices[faces]
+
+
+def viewer_axis_camera(direction: str) -> Dict:
+    if direction == "Theodolite":
+        diag_dir = normalize_vector(np.array([-1.0, -1.0, 0.0], dtype=float))
+        distance = 2.1
+        eye = diag_dir * distance
+        return {
+            "eye": {"x": float(eye[0]), "y": float(eye[1]), "z": float(eye[2])},
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+            "projection": {"type": "orthographic"},
+        }
+    distance = 1.8
+    eye_map = {
+        "+X": (distance, 0.0, 0.0),
+        "-X": (-distance, 0.0, 0.0),
+        "+Y": (0.0, distance, 0.0),
+        "-Y": (0.0, -distance, 0.0),
+        "+Z": (0.0, 0.0, distance),
+        "-Z": (0.0, 0.0, -distance),
+    }
+    up_map = {
+        "+X": (0.0, 0.0, 1.0),
+        "-X": (0.0, 0.0, 1.0),
+        "+Y": (0.0, 0.0, 1.0),
+        "-Y": (0.0, 0.0, 1.0),
+        "+Z": (0.0, 1.0, 0.0),
+        "-Z": (0.0, 1.0, 0.0),
+    }
+    eye = eye_map.get(direction, (distance, distance, distance))
+    up = up_map.get(direction, (0.0, 0.0, 1.0))
+    return {
+        "eye": {"x": eye[0], "y": eye[1], "z": eye[2]},
+        "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "up": {"x": up[0], "y": up[1], "z": up[2]},
+        "projection": {"type": "orthographic"},
+    }
+
+
+def set_viewer_axis_view(direction: str) -> None:
+    st.session_state["viewer_camera_override"] = viewer_axis_camera(direction)
+    st.session_state["viewer_camera_override_direction"] = direction
+    st.session_state["viewer_camera_rev"] += 1
 
 
 def plane_from_inputs() -> Tuple[np.ndarray, np.ndarray]:
@@ -535,8 +735,42 @@ def add_points_trace(
             mode="markers+text" if show_labels else "markers",
             text=text,
             textposition="top center",
-            marker=dict(size=size, color=color),
+            marker=dict(size=size, color=color, symbol="cross"),
             name=name,
+        )
+    )
+
+
+def add_mesh_trace(
+    fig: go.Figure,
+    vectors: np.ndarray,
+    *,
+    color: str,
+    opacity: float,
+    name: str,
+    showlegend: bool = True,
+) -> None:
+    if vectors is None or vectors.size == 0:
+        return
+    x = vectors[:, :, 0].ravel()
+    y = vectors[:, :, 1].ravel()
+    z = vectors[:, :, 2].ravel()
+    i = np.arange(0, len(x), 3)
+    j = i + 1
+    k = i + 2
+    fig.add_trace(
+        go.Mesh3d(
+            x=x,
+            y=y,
+            z=z,
+            i=i,
+            j=j,
+            k=k,
+            color=color,
+            opacity=opacity,
+            flatshading=True,
+            name=name,
+            showlegend=showlegend,
         )
     )
 
@@ -551,31 +785,67 @@ def render_scene(
     symbol_size: int,
     intersection_segments: List[Tuple[np.ndarray, np.ndarray]] | None = None,
     camera: Dict | None = None,
+    extra_mesh_traces: List[Dict] | None = None,
 ) -> None:
     vectors = stl_mesh.vectors
-    x = vectors[:, :, 0].ravel()
-    y = vectors[:, :, 1].ravel()
-    z = vectors[:, :, 2].ravel()
-    i = np.arange(0, len(x), 3)
-    j = i + 1
-    k = i + 2
+    fig = go.Figure()
+    add_mesh_trace(fig, vectors, color=color, opacity=opacity, name="Model")
+    for extra in extra_mesh_traces or []:
+        add_mesh_trace(
+            fig,
+            extra.get("vectors"),
+            color=extra.get("color", "#999999"),
+            opacity=float(extra.get("opacity", 0.35)),
+            name=str(extra.get("name", "Mesh")),
+            showlegend=bool(extra.get("showlegend", True)),
+        )
 
-    fig = go.Figure(
-        data=[
-            go.Mesh3d(
-                x=x,
-                y=y,
-                z=z,
-                i=i,
-                j=j,
-                k=k,
-                color=color,
-                opacity=opacity,
-                flatshading=True,
-                name="Model",
+    # Draw a small XYZ triad inside the scene to show coordinate directions.
+    mesh_points = vectors.reshape(-1, 3)
+    bounds_min = mesh_points.min(axis=0).astype(float)
+    bounds_max = mesh_points.max(axis=0).astype(float)
+    span = bounds_max - bounds_min
+    diag = float(np.linalg.norm(span)) or 1.0
+    span_safe = np.where(span > 0, span, diag * 0.2)
+    triad_origin = bounds_min + 0.08 * span_safe
+    triad_len = max(diag * 0.12, 1.0)
+    triad_axes = [
+        ("X", np.array([1.0, 0.0, 0.0]), "#d62728"),
+        ("Y", np.array([0.0, 1.0, 0.0]), "#2ca02c"),
+        ("Z", np.array([0.0, 0.0, 1.0]), "#1f77b4"),
+    ]
+    for axis_label, axis_dir, axis_color in triad_axes:
+        tip = triad_origin + axis_dir * triad_len
+        fig.add_trace(
+            go.Scatter3d(
+                x=[triad_origin[0], tip[0]],
+                y=[triad_origin[1], tip[1]],
+                z=[triad_origin[2], tip[2]],
+                mode="lines+text",
+                text=["", axis_label],
+                textposition="top center",
+                line=dict(color=axis_color, width=6),
+                showlegend=False,
+                hoverinfo="skip",
             )
-        ]
-    )
+        )
+        fig.add_trace(
+            go.Cone(
+                x=[tip[0]],
+                y=[tip[1]],
+                z=[tip[2]],
+                u=[axis_dir[0]],
+                v=[axis_dir[1]],
+                w=[axis_dir[2]],
+                anchor="tip",
+                sizemode="absolute",
+                sizeref=triad_len * 0.22,
+                showscale=False,
+                colorscale=[[0, axis_color], [1, axis_color]],
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
     if intersection_segments:
         xs, ys, zs = segments_to_trace_data(intersection_segments)
         fig.add_trace(
@@ -599,13 +869,121 @@ def render_scene(
             show_labels=show_labels,
         )
     uirev = f"coortrans-{st.session_state.get('viewer_camera_rev', 0)}"
+    snap_camera = st.session_state.get("viewer_camera_override")
+    snap_direction = st.session_state.get("viewer_camera_override_direction")
+    is_axis_snap_view = (
+        camera is not None
+        and snap_direction is not None
+        and isinstance(snap_camera, dict)
+        and camera == snap_camera
+        and snap_direction in AXIS_SNAP_DIRECTIONS
+    )
+    is_theodolite_view = (
+        camera is not None
+        and snap_direction == "Theodolite"
+        and isinstance(snap_camera, dict)
+        and camera == snap_camera
+    )
+    if is_theodolite_view:
+        reticle_len = max(diag * 0.035, 1.0)
+        reticle_radius = max(diag * 0.012, 0.4)
+        h_dir = normalize_vector(np.array([1.0, -1.0, 0.0], dtype=float))
+        v_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+        origin = np.array([0.0, 0.0, 0.0], dtype=float)
+        h0 = origin - h_dir * reticle_len
+        h1 = origin + h_dir * reticle_len
+        v0 = origin - v_dir * reticle_len
+        v1 = origin + v_dir * reticle_len
+        fig.add_trace(
+            go.Scatter3d(
+                x=[h0[0], h1[0], None, v0[0], v1[0]],
+                y=[h0[1], h1[1], None, v0[1], v1[1]],
+                z=[h0[2], h1[2], None, v0[2], v1[2]],
+                mode="lines",
+                line=dict(color="rgba(20,20,20,0.9)", width=3),
+                name="Theo Crosshair",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        theta = np.linspace(0.0, 2.0 * np.pi, 49)
+        circle_pts = origin + np.outer(np.cos(theta), h_dir) * reticle_radius + np.outer(
+            np.sin(theta), v_dir
+        ) * reticle_radius
+        fig.add_trace(
+            go.Scatter3d(
+                x=circle_pts[:, 0],
+                y=circle_pts[:, 1],
+                z=circle_pts[:, 2],
+                mode="lines",
+                line=dict(color="rgba(20,20,20,0.9)", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+    axis_style = dict(
+        showbackground=False,
+        showline=True,
+        linewidth=2,
+        linecolor="rgba(40, 40, 40, 0.65)",
+        gridcolor="rgba(120, 120, 120, 0.18)",
+        zeroline=True,
+        zerolinecolor="rgba(40, 40, 40, 0.45)",
+        zerolinewidth=1,
+        ticks="outside",
+        showspikes=False,
+    )
+    axis_title_x = "X (mm)"
+    axis_title_y = "Y (mm)"
+    axis_title_z = "Z (mm)"
+    hidden_tick_axis = None
+    if is_axis_snap_view and snap_direction:
+        hidden_tick_axis = snap_direction[-1].upper()
+    tick_font_size = 12 if is_axis_snap_view else 14
+    axis_tick_style = dict(
+        tickfont=dict(size=tick_font_size),
+        nticks=5 if is_axis_snap_view else 8,
+    )
     fig.update_layout(
-        scene=dict(aspectmode="data", uirevision=uirev, camera=camera),
-        margin=dict(l=0, r=0, t=20, b=0),
+        scene=dict(
+            aspectmode="data",
+            uirevision=uirev,
+            camera=camera,
+            xaxis=dict(
+                title=axis_title_x,
+                showticklabels=hidden_tick_axis != "X",
+                **axis_style,
+                **axis_tick_style,
+            ),
+            yaxis=dict(
+                title=axis_title_y,
+                showticklabels=hidden_tick_axis != "Y",
+                **axis_style,
+                **axis_tick_style,
+            ),
+            zaxis=dict(
+                title=axis_title_z,
+                showticklabels=hidden_tick_axis != "Z",
+                **axis_style,
+                **axis_tick_style,
+            ),
+        ),
+        margin=dict(l=18, r=14, t=36, b=18),
+        height=500,
         showlegend=True,
+        legend=dict(
+            x=0.02,
+            y=0.98,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.78)",
+            bordercolor="rgba(0,0,0,0.15)",
+            borderwidth=1,
+        ),
         uirevision=uirev,
     )
-    st.plotly_chart(fig, use_container_width=True, key="stl_viewer")
+    viewer_container = st.container(border=True)
+    viewer_container.plotly_chart(fig, use_container_width=True, key="stl_viewer")
 
 
 def points_editor(
@@ -627,6 +1005,7 @@ def points_editor(
     edited_df = st.data_editor(
         display_df,
         use_container_width=True,
+        hide_index=True,
         num_rows="dynamic",
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
@@ -721,6 +1100,9 @@ def build_project_payload(transform: Dict[str, np.ndarray] | None, errors=None) 
             "model_opacity": 1.0 - st.session_state["model_transparency"],
             "symbol_size": st.session_state["symbol_size"],
             "symbol_color": st.session_state["symbol_color"],
+            "beam_show": st.session_state["beam_show"],
+            "beam_size_y_mm": st.session_state["beam_size_y_mm"],
+            "beam_size_z_mm": st.session_state["beam_size_z_mm"],
         },
     }
     if transform is not None:
@@ -766,8 +1148,11 @@ def load_project(payload: Dict) -> None:
     st.session_state["model_color"] = settings.get("model_color", "#4c78a8")
     model_opacity = settings.get("model_opacity", 1.0)
     st.session_state["model_transparency"] = 1.0 - float(model_opacity)
-    st.session_state["symbol_size"] = int(settings.get("symbol_size", 6))
+    st.session_state["symbol_size"] = int(settings.get("symbol_size", 2))
     st.session_state["symbol_color"] = settings.get("symbol_color", "#e45756")
+    st.session_state["beam_show"] = bool(settings.get("beam_show", True))
+    st.session_state["beam_size_y_mm"] = float(settings.get("beam_size_y_mm", 4.0))
+    st.session_state["beam_size_z_mm"] = float(settings.get("beam_size_z_mm", 4.0))
 
 
 project_download_slot = None
@@ -816,10 +1201,69 @@ st.sidebar.color_picker(
 
 st.sidebar.radio(
     "View frame",
-    ["Sample", "Instrument"],
-    index=0 if st.session_state["view_frame"] == "Sample" else 1,
+    ["Sample", "Stage", "Instrument"],
+    index=["Sample", "Stage", "Instrument"].index(
+        st.session_state["view_frame"]
+        if st.session_state["view_frame"] in {"Sample", "Stage", "Instrument"}
+        else "Sample"
+    ),
     key="view_frame",
 )
+with st.sidebar.expander("Stage Placement", expanded=False):
+    st.caption("Built-in stage: 500 x 500 x 100 mm cuboid (top surface at stage z=0).")
+    st.checkbox("Show stage in Instrument view", value=True, key="stage_show")
+    st.caption("Stage pose in instrument frame")
+    st.number_input("Stage X (mm)", step=1.0, key="stage_tx")
+    st.number_input("Stage Y (mm)", step=1.0, key="stage_ty")
+    st.number_input("Stage Z (mm)", step=1.0, key="stage_tz")
+    st.caption("Stage rotation about instrument Z")
+    st.number_input("Stage Rz (deg)", step=1.0, key="stage_rz")
+    st.caption("Sample mount pose in stage frame")
+    mount_pos_cols = st.columns(3)
+    with mount_pos_cols[0]:
+        st.number_input("Sample X (mm)", step=1.0, key="sample_mount_tx")
+    with mount_pos_cols[1]:
+        st.number_input("Sample Y (mm)", step=1.0, key="sample_mount_ty")
+    with mount_pos_cols[2]:
+        st.number_input("Sample Z (mm)", step=1.0, key="sample_mount_tz")
+    mount_rot_cols = st.columns(3)
+    with mount_rot_cols[0]:
+        st.number_input("Sample Rx (deg)", step=1.0, key="sample_mount_rx")
+    with mount_rot_cols[1]:
+        st.number_input("Sample Ry (deg)", step=1.0, key="sample_mount_ry")
+    with mount_rot_cols[2]:
+        st.number_input("Sample Rz (deg)", step=1.0, key="sample_mount_rz")
+    st.selectbox(
+        "Instrument sample pose source",
+        ["Stage preview", "Theodolite fit", "Both"],
+        index=["Stage preview", "Theodolite fit", "Both"].index(
+            st.session_state.get("instrument_pose_source", "Theodolite fit")
+            if st.session_state.get("instrument_pose_source")
+            in {"Stage preview", "Theodolite fit", "Both"}
+            else "Theodolite fit"
+        ),
+        key="instrument_pose_source",
+    )
+with st.sidebar.expander("Beam (Instrument)", expanded=False):
+    st.caption("Beam travels along +X toward the instrument origin (0, 0, 0).")
+    st.checkbox("Show beam in Instrument view", value=True, key="beam_show")
+    beam_cols = st.columns(2)
+    with beam_cols[0]:
+        st.number_input(
+            "Beam size Y (mm)",
+            min_value=0.1,
+            step=0.1,
+            format="%.1f",
+            key="beam_size_y_mm",
+        )
+    with beam_cols[1]:
+        st.number_input(
+            "Beam size Z (mm)",
+            min_value=0.1,
+            step=0.1,
+            format="%.1f",
+            key="beam_size_z_mm",
+        )
 with st.sidebar.expander("Transform", expanded=True):
     st.number_input(
         "Scale (unitless)",
@@ -952,6 +1396,8 @@ with st.sidebar.expander("Plane Selection", expanded=False):
     )
     if st.button("Clear Plane Markers"):
         st.session_state["plane_pick_uv"] = []
+        st.session_state["plane_preview_uv"] = []
+        st.session_state["last_plane_preview_id"] = None
         st.session_state["plane_pick_rev"] += 1
 
     if st.session_state["plane_mode"] == "Three Points":
@@ -1005,7 +1451,7 @@ with st.sidebar.expander("Plane Selection", expanded=False):
             key="plane_offset",
         )
 
-left_col, right_col = st.columns([1, 1])
+left_col, right_col = st.columns([1.5, 1.0])
 
 with left_col:
     tab1, tab2, tab3 = st.tabs(
@@ -1138,6 +1584,19 @@ if project_download_slot is not None:
     )
 st.subheader("Viewer")
 
+view_btn_cols = st.columns(7)
+for btn_col, direction in zip(
+    view_btn_cols, ["+X", "-X", "+Y", "-Y", "+Z", "-Z", "Theodolite"]
+):
+    with btn_col:
+        st.button(
+            "Theo" if direction == "Theodolite" else direction,
+            key=f"viewer_snap_{direction}",
+            use_container_width=True,
+            on_click=set_viewer_axis_view,
+            args=(direction,),
+        )
+
 if st.session_state["stl_bytes"] is None:
     st.info("Upload an STL file to view it here.")
 else:
@@ -1147,7 +1606,39 @@ else:
         plane_params = None
         plane_origin = None
         plane_normal = None
-        camera = None
+        camera = st.session_state.get("viewer_camera_override")
+        stage_extra_meshes = []
+        stage_preview_transform = None
+        stage_matrix = pose_matrix_xyz(
+            float(st.session_state["stage_tx"]),
+            float(st.session_state["stage_ty"]),
+            float(st.session_state["stage_tz"]),
+            0.0,
+            0.0,
+            float(st.session_state["stage_rz"]),
+        )
+        sample_mount_matrix = pose_matrix_xyz(
+            float(st.session_state["sample_mount_tx"]),
+            float(st.session_state["sample_mount_ty"]),
+            float(st.session_state["sample_mount_tz"]),
+            float(st.session_state["sample_mount_rx"]),
+            float(st.session_state["sample_mount_ry"]),
+            float(st.session_state["sample_mount_rz"]),
+        )
+        stage_preview_matrix = stage_matrix @ sample_mount_matrix
+        stage_preview_transform = matrix_to_rigid_transform(stage_preview_matrix)
+        if st.session_state["stage_show"]:
+            stage_vectors = cuboid_vectors(*STAGE_DIMS_MM)
+            stage_vectors_instr = transform_vectors_by_matrix(stage_vectors, stage_matrix)
+            stage_extra_meshes.append(
+                {
+                    "vectors": stage_vectors_instr,
+                    "color": "#8d99ae",
+                    "opacity": 0.35,
+                    "name": "Stage",
+                    "showlegend": True,
+                }
+            )
         if st.session_state["plane_enabled"] and st.session_state["view_frame"] == "Sample":
             p0, n = plane_from_inputs()
             if np.linalg.norm(n) == 0:
@@ -1168,6 +1659,8 @@ else:
                 if st.session_state["plane_signature"] != signature:
                     st.session_state["plane_signature"] = signature
                     st.session_state["plane_pick_uv"] = []
+                    st.session_state["plane_preview_uv"] = []
+                    st.session_state["last_plane_preview_id"] = None
                     st.session_state["plane_pick_rev"] += 1
                 if (
                     st.session_state["plane_view_normal"]
@@ -1190,18 +1683,40 @@ else:
             feature_points, feature_labels = df_to_points(
                 st.session_state["feature_sample_df"]
             )
-            show_live_points = (
-                not st.session_state["plane_enabled"]
-                or st.session_state["plane_show_3d_points_live"]
-            )
-            if show_live_points:
-                if target_points.size:
+            # Always render committed/manual points in sample view.
+            # Plane-picker performance toggles should not hide user-entered coordinates.
+            if target_points.size:
+                point_traces.append(
+                    (target_points, target_labels, "Target Points", "#2ca02c")
+                )
+            if feature_points.size:
+                point_traces.append(
+                    (feature_points, feature_labels, "Feature Points", "#d62728")
+                )
+            if (
+                st.session_state["plane_enabled"]
+                and st.session_state["plane_show_3d_points_live"]
+                and plane_params is not None
+                and plane_origin is not None
+                and st.session_state["plane_preview_uv"]
+            ):
+                u_axis_preview, v_axis_preview, *_ = plane_params
+                preview_rows = []
+                for uv in st.session_state["plane_preview_uv"]:
+                    uu = float(uv[0])
+                    vv = float(uv[1])
+                    picked = plane_origin + u_axis_preview * uu + v_axis_preview * vv
+                    if st.session_state["plane_snap_to_curve"] and intersection_segments:
+                        picked, _ = nearest_point_on_segments(picked, intersection_segments)
+                    preview_rows.append(picked)
+                if preview_rows:
                     point_traces.append(
-                        (target_points, target_labels, "Target Points", "#2ca02c")
-                    )
-                if feature_points.size:
-                    point_traces.append(
-                        (feature_points, feature_labels, "Feature Points", "#d62728")
+                        (
+                            np.array(preview_rows, dtype=float),
+                            [""] * len(preview_rows),
+                            "Pending Picks (Preview)",
+                            "#9467bd",
+                        )
                     )
             render_scene(
                 stl_mesh,
@@ -1212,6 +1727,7 @@ else:
                 symbol_size=st.session_state["symbol_size"],
                 intersection_segments=intersection_segments,
                 camera=camera,
+                extra_mesh_traces=None,
             )
             if (
                 st.session_state["plane_enabled"]
@@ -1244,12 +1760,27 @@ else:
                         segments=segments_uv,
                         picks=st.session_state["plane_pick_uv"],
                         picks_rev=st.session_state["plane_pick_rev"],
+                        live_preview=st.session_state["plane_show_3d_points_live"],
                         width=1000,
                         height=520,
                         key="plane_picker",
                     )
-                    if pick and pick.get("commit_id") != st.session_state["last_plane_commit_id"]:
+                    if pick and "preview_id" in pick:
+                        preview_id = pick.get("preview_id")
+                        if preview_id != st.session_state["last_plane_preview_id"]:
+                            st.session_state["last_plane_preview_id"] = preview_id
+                            st.session_state["plane_preview_uv"] = pick.get(
+                                "preview_picks", []
+                            )
+                    if (
+                        pick
+                        and "commit_id" in pick
+                        and pick.get("commit_id")
+                        != st.session_state["last_plane_commit_id"]
+                    ):
                         st.session_state["last_plane_commit_id"] = pick.get("commit_id")
+                        st.session_state["plane_preview_uv"] = []
+                        st.session_state["last_plane_preview_id"] = None
                         uv_points = pick.get("picks", [])
                         if uv_points:
                             add_to = st.session_state["click_add_to"]
@@ -1281,8 +1812,78 @@ else:
                             if rows:
                                 df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
                                 st.session_state[df_key] = df
+        elif st.session_state["view_frame"] == "Stage":
+            stage_vectors = cuboid_vectors(*STAGE_DIMS_MM)
+            mounted_mesh = transform_mesh_by_matrix(stl_mesh, sample_mount_matrix)
+            target_points, target_labels = df_to_points(st.session_state["target_sample_df"])
+            feature_points, feature_labels = df_to_points(
+                st.session_state["feature_sample_df"]
+            )
+            stage_point_traces = []
+            mounted_targets = apply_pose_matrix(target_points, sample_mount_matrix)
+            mounted_features = apply_pose_matrix(feature_points, sample_mount_matrix)
+            if mounted_targets.size:
+                stage_point_traces.append(
+                    (mounted_targets, target_labels, "Target Points (Stage)", "#2ca02c")
+                )
+            if mounted_features.size:
+                stage_point_traces.append(
+                    (mounted_features, feature_labels, "Feature Points (Stage)", "#d62728")
+                )
+            render_scene(
+                mounted_mesh,
+                opacity=1.0 - st.session_state["model_transparency"],
+                color=st.session_state["model_color"],
+                point_traces=stage_point_traces,
+                show_labels=st.session_state["show_symbols"],
+                symbol_size=st.session_state["symbol_size"],
+                intersection_segments=None,
+                camera=camera,
+                extra_mesh_traces=[
+                    {
+                        "vectors": stage_vectors,
+                        "color": "#8d99ae",
+                        "opacity": 0.35,
+                        "name": "Stage",
+                        "showlegend": True,
+                    }
+                ],
+            )
         else:
-            if transform_result is None:
+            pose_source = st.session_state.get("instrument_pose_source", "Theodolite fit")
+            fit_pose = transform_result
+            preview_pose = stage_preview_transform
+            instrument_pose = None
+            secondary_pose = None
+            secondary_pose_name = None
+            secondary_pose_color = None
+            show_stage_preview_info = False
+
+            if pose_source == "Stage preview":
+                instrument_pose = preview_pose
+                if fit_pose is not None:
+                    st.info("Instrument view is showing the stage placement preview pose.")
+            elif pose_source == "Theodolite fit":
+                if fit_pose is not None:
+                    instrument_pose = fit_pose
+                else:
+                    instrument_pose = preview_pose
+                    show_stage_preview_info = True
+            elif pose_source == "Both":
+                if fit_pose is not None:
+                    instrument_pose = fit_pose
+                    if preview_pose is not None:
+                        secondary_pose = preview_pose
+                        secondary_pose_name = "Sample (Stage Preview)"
+                        secondary_pose_color = "#6c757d"
+                else:
+                    instrument_pose = preview_pose
+                    show_stage_preview_info = True
+            else:
+                instrument_pose = fit_pose or preview_pose
+                show_stage_preview_info = fit_pose is None and preview_pose is not None
+
+            if instrument_pose is None:
                 st.warning("Transform not available; showing sample frame instead.")
                 target_points, target_labels = df_to_points(
                     st.session_state["target_sample_df"]
@@ -1292,11 +1893,21 @@ else:
                 )
                 if target_points.size:
                     point_traces.append(
-                        (target_points, target_labels, "Target Points", "#2ca02c")
+                        (
+                            target_points,
+                            target_labels,
+                            "Target Points",
+                            "#2ca02c",
+                        )
                     )
                 if feature_points.size:
                     point_traces.append(
-                        (feature_points, feature_labels, "Feature Points", "#d62728")
+                        (
+                            feature_points,
+                            feature_labels,
+                            "Feature Points",
+                            "#d62728",
+                        )
                     )
                 render_scene(
                     stl_mesh,
@@ -1307,13 +1918,77 @@ else:
                     symbol_size=st.session_state["symbol_size"],
                     intersection_segments=intersection_segments,
                     camera=camera,
+                    extra_mesh_traces=None,
                 )
             else:
-                transformed_mesh = transform_mesh(stl_mesh, transform_result)
+                if show_stage_preview_info:
+                    st.info(
+                        "Using stage placement preview in instrument frame. "
+                        "Compute theodolite transform to refine the final pose."
+                    )
+                transformed_mesh = transform_mesh(stl_mesh, instrument_pose)
                 target_points, target_labels = df_to_points(
                     st.session_state["target_sample_df"]
                 )
-                transformed_targets = apply_transform(target_points, transform_result)
+                transformed_targets = apply_transform(target_points, instrument_pose)
+                instrument_extra_meshes = list(stage_extra_meshes)
+                if st.session_state.get("beam_show", True):
+                    x_points = [transformed_mesh.vectors[:, :, 0].min()]
+                    x_points.append(0.0)
+                    for extra_mesh in instrument_extra_meshes:
+                        extra_vectors = extra_mesh.get("vectors")
+                        if isinstance(extra_vectors, np.ndarray) and extra_vectors.size:
+                            x_points.append(float(extra_vectors[:, :, 0].min()))
+                    x_min_scene = float(min(x_points))
+                    x_max_scene = float(
+                        max(
+                            [0.0, float(transformed_mesh.vectors[:, :, 0].max())]
+                            + [
+                                float(extra_mesh["vectors"][:, :, 0].max())
+                                for extra_mesh in instrument_extra_meshes
+                                if isinstance(extra_mesh.get("vectors"), np.ndarray)
+                                and extra_mesh["vectors"].size
+                            ]
+                        )
+                    )
+                    x_span_scene = max(x_max_scene - x_min_scene, 1.0)
+                    beam_margin = max(20.0, 0.08 * x_span_scene)
+                    beam_start_x = min(-500.0, x_min_scene - beam_margin)
+                    beam_vectors = beam_cuboid_vectors(
+                        beam_start_x,
+                        0.0,
+                        float(st.session_state.get("beam_size_y_mm", 4.0)),
+                        float(st.session_state.get("beam_size_z_mm", 4.0)),
+                    )
+                    instrument_extra_meshes.append(
+                        {
+                            "vectors": beam_vectors,
+                            "color": "#f4c430",
+                            "opacity": 0.55,
+                            "name": "Beam",
+                            "showlegend": True,
+                        }
+                    )
+                if secondary_pose is not None:
+                    secondary_mesh = transform_mesh(stl_mesh, secondary_pose)
+                    instrument_extra_meshes.append(
+                        {
+                            "vectors": secondary_mesh.vectors,
+                            "color": secondary_pose_color or "#6c757d",
+                            "opacity": 0.22,
+                            "name": secondary_pose_name or "Sample (Secondary Pose)",
+                            "showlegend": True,
+                        }
+                    )
+                    if target_points.size:
+                        point_traces.append(
+                            (
+                                apply_transform(target_points, secondary_pose),
+                                target_labels,
+                                "Target Points (Stage Preview)",
+                                "#17becf",
+                            )
+                        )
                 feature_instr_points, feature_instr_labels = df_to_points(
                     st.session_state["feature_instrument_df"]
                 )
@@ -1343,7 +2018,8 @@ else:
                     show_labels=st.session_state["show_symbols"],
                     symbol_size=st.session_state["symbol_size"],
                     intersection_segments=None,
-                    camera=None,
+                    camera=camera,
+                    extra_mesh_traces=instrument_extra_meshes,
                 )
     except Exception as exc:
         st.error(f"Failed to load STL file: {exc}")
