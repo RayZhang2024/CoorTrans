@@ -928,33 +928,94 @@ def render_scene(
     intersection_segments: List[Tuple[np.ndarray, np.ndarray]] | None = None,
     camera: Dict | None = None,
     extra_mesh_traces: List[Dict] | None = None,
+    triad_basis: np.ndarray | None = None,
+    triad_origin_override: np.ndarray | None = None,
+    display_rotation: np.ndarray | None = None,
 ) -> None:
-    vectors = stl_mesh.vectors
+    def _rotate_pts_display(points: np.ndarray) -> np.ndarray:
+        if display_rotation is None:
+            return points
+        if not isinstance(points, np.ndarray) or points.size == 0:
+            return points
+        rot = np.array(display_rotation, dtype=float)
+        pts = np.array(points, dtype=float, copy=True)
+        return pts @ rot.T
+
+    def _rotate_camera_display(camera_dict: Dict | None) -> Dict | None:
+        if display_rotation is None or not isinstance(camera_dict, dict):
+            return camera_dict
+        rot = np.array(display_rotation, dtype=float)
+        camera_out = dict(camera_dict)
+        for key in ("eye", "center", "up"):
+            vec = camera_dict.get(key)
+            if isinstance(vec, dict) and {"x", "y", "z"} <= set(vec.keys()):
+                arr = np.array([vec["x"], vec["y"], vec["z"]], dtype=float)
+                arr_rot = rot @ arr
+                camera_out[key] = {
+                    "x": float(arr_rot[0]),
+                    "y": float(arr_rot[1]),
+                    "z": float(arr_rot[2]),
+                }
+        return camera_out
+
+    vectors = _rotate_pts_display(stl_mesh.vectors)
+    camera_display = _rotate_camera_display(camera)
     fig = go.Figure()
     add_mesh_trace(fig, vectors, color=color, opacity=opacity, name="Model")
     for extra in extra_mesh_traces or []:
+        extra_vectors = _rotate_pts_display(extra.get("vectors"))
         add_mesh_trace(
             fig,
-            extra.get("vectors"),
+            extra_vectors,
             color=extra.get("color", "#999999"),
             opacity=float(extra.get("opacity", 0.35)),
             name=str(extra.get("name", "Mesh")),
             showlegend=bool(extra.get("showlegend", True)),
         )
 
-    # Draw a small XYZ triad inside the scene to show coordinate directions.
-    mesh_points = vectors.reshape(-1, 3)
+    # Draw an XYZ triad to show coordinate directions. Include extra meshes/points so the
+    # triad remains visible when the sample mesh is much smaller than the stage preview.
+    scene_points = [vectors.reshape(-1, 3)]
+    for extra in extra_mesh_traces or []:
+        extra_vectors = _rotate_pts_display(extra.get("vectors"))
+        if isinstance(extra_vectors, np.ndarray) and extra_vectors.size:
+            scene_points.append(extra_vectors.reshape(-1, 3))
+    point_traces_display = []
+    for pts, labels, name, trace_color in point_traces:
+        pts_display = _rotate_pts_display(pts)
+        point_traces_display.append((pts_display, labels, name, trace_color))
+    for pts, _, _, _ in point_traces_display:
+        if isinstance(pts, np.ndarray) and pts.size:
+            scene_points.append(pts.reshape(-1, 3))
+    if intersection_segments:
+        seg_pts = []
+        for p0, p1 in intersection_segments:
+            seg_pts.append(_rotate_pts_display(np.array(p0, dtype=float).reshape(1, 3))[0])
+            seg_pts.append(_rotate_pts_display(np.array(p1, dtype=float).reshape(1, 3))[0])
+        if seg_pts:
+            scene_points.append(np.vstack(seg_pts))
+    mesh_points = np.vstack(scene_points)
     bounds_min = mesh_points.min(axis=0).astype(float)
     bounds_max = mesh_points.max(axis=0).astype(float)
     span = bounds_max - bounds_min
     diag = float(np.linalg.norm(span)) or 1.0
     span_safe = np.where(span > 0, span, diag * 0.2)
-    triad_origin = bounds_min + 0.08 * span_safe
-    triad_len = max(diag * 0.12, 1.0)
+    triad_origin = (
+        _rotate_pts_display(np.array(triad_origin_override, dtype=float).reshape(1, 3))[0]
+        if triad_origin_override is not None
+        else bounds_min + 0.08 * span_safe
+    )
+    triad_len = max(diag * (0.02 if triad_origin_override is not None else 0.045), 1.0)
+    if triad_basis is None:
+        triad_basis = np.eye(3, dtype=float)
+    if display_rotation is not None:
+        triad_basis = np.array(display_rotation, dtype=float) @ np.array(
+            triad_basis, dtype=float
+        )
     triad_axes = [
-        ("X", np.array([1.0, 0.0, 0.0]), "#d62728"),
-        ("Y", np.array([0.0, 1.0, 0.0]), "#2ca02c"),
-        ("Z", np.array([0.0, 0.0, 1.0]), "#1f77b4"),
+        ("X", normalize_vector(np.array(triad_basis[:3, 0], dtype=float)), "#d62728"),
+        ("Y", normalize_vector(np.array(triad_basis[:3, 1], dtype=float)), "#2ca02c"),
+        ("Z", normalize_vector(np.array(triad_basis[:3, 2], dtype=float)), "#1f77b4"),
     ]
     for axis_label, axis_dir, axis_color in triad_axes:
         tip = triad_origin + axis_dir * triad_len
@@ -981,7 +1042,7 @@ def render_scene(
                 w=[axis_dir[2]],
                 anchor="tip",
                 sizemode="absolute",
-                sizeref=triad_len * 0.22,
+                sizeref=triad_len * 0.26,
                 showscale=False,
                 colorscale=[[0, axis_color], [1, axis_color]],
                 showlegend=False,
@@ -989,7 +1050,15 @@ def render_scene(
             )
         )
     if intersection_segments:
-        xs, ys, zs = segments_to_trace_data(intersection_segments)
+        xs, ys, zs = segments_to_trace_data(
+            [
+                (
+                    _rotate_pts_display(np.array(p0, dtype=float).reshape(1, 3))[0],
+                    _rotate_pts_display(np.array(p1, dtype=float).reshape(1, 3))[0],
+                )
+                for p0, p1 in intersection_segments
+            ]
+        )
         fig.add_trace(
             go.Scatter3d(
                 x=xs,
@@ -1000,7 +1069,7 @@ def render_scene(
                 name="Plane Intersection",
             )
         )
-    for points, labels, name, trace_color in point_traces:
+    for points, labels, name, trace_color in point_traces_display:
         add_points_trace(
             fig,
             points,
@@ -1031,6 +1100,29 @@ def render_scene(
         reticle_radius = max(diag * 0.012, 0.4)
         h_dir = normalize_vector(np.array([1.0, -1.0, 0.0], dtype=float))
         v_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+        if isinstance(camera_display, dict):
+            eye_obj = camera_display.get("eye")
+            up_obj = camera_display.get("up")
+            if isinstance(eye_obj, dict) and isinstance(up_obj, dict):
+                eye_vec = np.array(
+                    [eye_obj.get("x", 0.0), eye_obj.get("y", 0.0), eye_obj.get("z", 0.0)],
+                    dtype=float,
+                )
+                up_vec = np.array(
+                    [up_obj.get("x", 0.0), up_obj.get("y", 0.0), up_obj.get("z", 1.0)],
+                    dtype=float,
+                )
+                view_dir = normalize_vector(-eye_vec)
+                if np.linalg.norm(view_dir) > 0:
+                    up_proj = up_vec - np.dot(up_vec, view_dir) * view_dir
+                    up_proj = normalize_vector(up_proj)
+                    h_candidate = np.cross(view_dir, up_proj)
+                    h_candidate = normalize_vector(h_candidate)
+                    v_candidate = np.cross(h_candidate, view_dir)
+                    v_candidate = normalize_vector(v_candidate)
+                    if np.linalg.norm(h_candidate) > 0 and np.linalg.norm(v_candidate) > 0:
+                        h_dir = h_candidate
+                        v_dir = v_candidate
         origin = np.array([0.0, 0.0, 0.0], dtype=float)
         h0 = origin - h_dir * reticle_len
         h1 = origin + h_dir * reticle_len
@@ -1090,7 +1182,7 @@ def render_scene(
         scene=dict(
             aspectmode="data",
             uirevision=uirev,
-            camera=camera,
+            camera=camera_display,
             xaxis=dict(
                 title=axis_title_x,
                 showticklabels=hidden_tick_axis != "X",
@@ -1794,7 +1886,14 @@ else:
             ],
             dtype=float,
         )
-        stage_center_instr = apply_pose_matrix(stage_center_stage, stage_matrix)
+        stage_corner_stage = np.array(
+            [[-STAGE_DIMS_MM[0] / 2.0, -STAGE_DIMS_MM[1] / 2.0, 0.0]],
+            dtype=float,
+        )
+        # In instrument/theodolite view, the correlated center is the fixed instrument
+        # center (the Theo crosshair), so it remains at the instrument origin.
+        stage_center_instr = np.array([[0.0, 0.0, 0.0]], dtype=float)
+        stage_corner_instr = apply_pose_matrix(stage_corner_stage, stage_matrix)
         sample_mount_matrix = pose_matrix_xyz(
             float(st.session_state["sample_mount_tx"]),
             float(st.session_state["sample_mount_ty"]),
@@ -2214,6 +2313,9 @@ else:
                     intersection_segments=None,
                     camera=camera,
                     extra_mesh_traces=instrument_extra_meshes,
+                    triad_basis=stage_matrix[:3, :3],
+                    triad_origin_override=stage_corner_instr[0],
+                    display_rotation=stage_matrix[:3, :3].T,
                 )
     except Exception as exc:
         st.error(f"Failed to load STL file: {exc}")
