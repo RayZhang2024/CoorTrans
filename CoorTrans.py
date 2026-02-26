@@ -75,11 +75,16 @@ def init_state() -> None:
         "viewer_camera_rev": 0,
         "viewer_camera_override": None,
         "viewer_camera_override_direction": None,
+        "mount_fit_apply_status_level": "",
+        "mount_fit_apply_status_msg": "",
         "instrument_pose_source": "Theodolite fit",
         "beam_show": True,
         "beam_size_y_mm": 4.0,
         "beam_size_z_mm": 4.0,
         "stage_show": True,
+        "stage_center_gx": 0.0,
+        "stage_center_gy": 0.0,
+        "stage_center_gz": 0.0,
         "stage_tx": 0.0,
         "stage_ty": 0.0,
         "stage_tz": 0.0,
@@ -261,6 +266,32 @@ def pose_matrix_xyz(
     return mat
 
 
+def stage_pose_matrix_from_state() -> np.ndarray:
+    # Stage translations are entered along stage axes (local frame), not instrument axes.
+    # Rotation occurs about the correlated stage-center point C_G that coincides with the
+    # instrument beam/theodolite center (instrument origin) when Stage X/Y/Z = 0.
+    # p_I = R * p_G + R * (d_G - C_G), where d_G is local-stage translation.
+    tx_local = float(st.session_state["stage_tx"])
+    ty_local = float(st.session_state["stage_ty"])
+    tz_local = float(st.session_state["stage_tz"])
+    center_g = np.array(
+        [
+            float(st.session_state["stage_center_gx"]),
+            float(st.session_state["stage_center_gy"]),
+            float(st.session_state["stage_center_gz"]),
+        ],
+        dtype=float,
+    )
+    rz_deg = float(st.session_state["stage_rz"])
+    R = rotation_matrix_xyz_deg(0.0, 0.0, rz_deg)
+    d_local = np.array([tx_local, ty_local, tz_local], dtype=float)
+    t_instr = R @ (d_local - center_g)
+    mat = np.eye(4)
+    mat[:3, :3] = R
+    mat[:3, 3] = t_instr
+    return mat
+
+
 def apply_pose_matrix(points: np.ndarray, mat: np.ndarray) -> np.ndarray:
     if points.size == 0:
         return points
@@ -293,6 +324,117 @@ def matrix_to_rigid_transform(mat: np.ndarray) -> Dict[str, np.ndarray]:
         "translation": t,
         "axis_flip": "none",
     }
+
+
+def rotation_matrix_to_xyz_deg(rot: np.ndarray) -> Tuple[float, float, float]:
+    # Project to the nearest proper rotation to reduce numerical noise.
+    U, _, Vt = np.linalg.svd(rot)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    if np.linalg.det(R) < 0:
+        raise ValueError("Rotation matrix is not a proper rotation.")
+
+    r20 = float(np.clip(R[2, 0], -1.0, 1.0))
+    ry = float(np.arcsin(-r20))
+    cy = float(np.cos(ry))
+    if abs(cy) > 1e-8:
+        rx = float(np.arctan2(R[2, 1], R[2, 2]))
+        rz = float(np.arctan2(R[1, 0], R[0, 0]))
+    else:
+        # Gimbal lock: choose rx=0 and solve rz from remaining terms.
+        rx = 0.0
+        if r20 <= -1.0 + 1e-8:
+            ry = np.pi / 2.0
+            rz = float(np.arctan2(-R[0, 1], R[1, 1]))
+        else:
+            ry = -np.pi / 2.0
+            rz = float(np.arctan2(R[0, 1], R[1, 1]))
+    return tuple(np.rad2deg([rx, ry, rz]))
+
+
+def _set_mount_fit_status(level: str, msg: str) -> None:
+    st.session_state["mount_fit_apply_status_level"] = level
+    st.session_state["mount_fit_apply_status_msg"] = msg
+
+
+def apply_theodolite_fit_to_stage_mount() -> None:
+    P_feat, _ = df_to_points(st.session_state["feature_sample_df"])
+    Q_feat, _ = df_to_points(st.session_state["feature_instrument_df"])
+    if P_feat.shape[0] != Q_feat.shape[0] or not (4 <= P_feat.shape[0] <= 6):
+        _set_mount_fit_status(
+            "warning",
+            "Need 4 to 6 matching feature points in sample and instrument tables.",
+        )
+        return
+
+    try:
+        transform_result = solve_transform(
+            P_feat,
+            Q_feat,
+            scale_value=float(st.session_state["scale_value"]),
+            auto_scale=bool(st.session_state["auto_scale"]),
+            axis_flip=st.session_state["axis_flip"],
+            enforce_proper=True,
+        )
+    except Exception as exc:
+        _set_mount_fit_status("error", f"Failed to solve transform: {exc}")
+        return
+
+    scale = float(transform_result["scale"])
+    if abs(scale - 1.0) > 1e-3:
+        _set_mount_fit_status(
+            "warning",
+            f"Fit scale is {scale:.6f}. Apply to stage mount only when scale is ~1.0.",
+        )
+        return
+
+    if str(transform_result.get("axis_flip", "none")) != "none":
+        _set_mount_fit_status(
+            "warning",
+            "Axis flip is enabled. Reflections cannot be written into rigid stage mount angles.",
+        )
+        return
+
+    R_is = np.array(transform_result["rotation_effective"], dtype=float)
+    det_r = float(np.linalg.det(R_is))
+    if det_r <= 0 or not np.isfinite(det_r):
+        _set_mount_fit_status(
+            "warning",
+            "Solved transform is not a proper rigid rotation; cannot apply to stage mount.",
+        )
+        return
+
+    T_I_S = np.eye(4)
+    T_I_S[:3, :3] = R_is
+    T_I_S[:3, 3] = np.array(transform_result["translation"], dtype=float)
+
+    T_I_G = stage_pose_matrix_from_state()
+    try:
+        T_G_I = np.linalg.inv(T_I_G)
+    except np.linalg.LinAlgError:
+        _set_mount_fit_status("error", "Stage pose matrix is singular; cannot invert.")
+        return
+
+    T_G_S = T_G_I @ T_I_S
+    t_gs = T_G_S[:3, 3]
+    try:
+        rx_deg, ry_deg, rz_deg = rotation_matrix_to_xyz_deg(T_G_S[:3, :3])
+    except Exception as exc:
+        _set_mount_fit_status("error", f"Failed to derive sample mount angles: {exc}")
+        return
+
+    st.session_state["sample_mount_tx"] = float(t_gs[0])
+    st.session_state["sample_mount_ty"] = float(t_gs[1])
+    st.session_state["sample_mount_tz"] = float(t_gs[2])
+    st.session_state["sample_mount_rx"] = float(rx_deg)
+    st.session_state["sample_mount_ry"] = float(ry_deg)
+    st.session_state["sample_mount_rz"] = float(rz_deg)
+    _set_mount_fit_status(
+        "success",
+        "Applied theodolite fit to sample mount pose (stage frame).",
+    )
 
 
 def cuboid_vectors(width: float, length: float, height: float) -> np.ndarray:
@@ -1212,7 +1354,17 @@ st.sidebar.radio(
 with st.sidebar.expander("Stage Placement", expanded=False):
     st.caption("Built-in stage: 500 x 500 x 100 mm cuboid (top surface at stage z=0).")
     st.checkbox("Show stage in Instrument view", value=True, key="stage_show")
-    st.caption("Stage pose in instrument frame")
+    st.caption(
+        "Correlated stage-center point in stage frame (this point coincides with the "
+        "instrument beam/theodolite center at Stage X/Y/Z = 0)."
+    )
+    st.number_input("Stage Center X (stage mm)", step=1.0, key="stage_center_gx")
+    st.number_input("Stage Center Y (stage mm)", step=1.0, key="stage_center_gy")
+    st.number_input("Stage Center Z (stage mm)", step=1.0, key="stage_center_gz")
+    st.caption(
+        "Stage pose in instrument frame (Stage X/Y/Z are motions along stage local axes; "
+        "rotation is about the correlated stage center)."
+    )
     st.number_input("Stage X (mm)", step=1.0, key="stage_tx")
     st.number_input("Stage Y (mm)", step=1.0, key="stage_ty")
     st.number_input("Stage Z (mm)", step=1.0, key="stage_tz")
@@ -1569,6 +1721,28 @@ with right_col:
             file_name="transform_matrix.csv",
             mime="text/csv",
         )
+        st.caption(
+            "Use the current stage pose (instrument frame) to convert the solved sample pose "
+            "into sample mount coordinates on the stage."
+        )
+        st.button(
+            "Apply Theodolite Fit To Stage Mount",
+            on_click=apply_theodolite_fit_to_stage_mount,
+            disabled=transform_result is None,
+            use_container_width=True,
+        )
+
+        mount_apply_level = st.session_state.get("mount_fit_apply_status_level", "")
+        mount_apply_msg = st.session_state.get("mount_fit_apply_status_msg", "")
+        if mount_apply_msg:
+            if mount_apply_level == "success":
+                st.success(mount_apply_msg)
+            elif mount_apply_level == "warning":
+                st.warning(mount_apply_msg)
+            elif mount_apply_level == "error":
+                st.error(mount_apply_msg)
+            else:
+                st.info(mount_apply_msg)
 
     if transform_warnings:
         for msg in transform_warnings:
@@ -1609,14 +1783,18 @@ else:
         camera = st.session_state.get("viewer_camera_override")
         stage_extra_meshes = []
         stage_preview_transform = None
-        stage_matrix = pose_matrix_xyz(
-            float(st.session_state["stage_tx"]),
-            float(st.session_state["stage_ty"]),
-            float(st.session_state["stage_tz"]),
-            0.0,
-            0.0,
-            float(st.session_state["stage_rz"]),
+        stage_matrix = stage_pose_matrix_from_state()
+        stage_center_stage = np.array(
+            [
+                [
+                    float(st.session_state["stage_center_gx"]),
+                    float(st.session_state["stage_center_gy"]),
+                    float(st.session_state["stage_center_gz"]),
+                ]
+            ],
+            dtype=float,
         )
+        stage_center_instr = apply_pose_matrix(stage_center_stage, stage_matrix)
         sample_mount_matrix = pose_matrix_xyz(
             float(st.session_state["sample_mount_tx"]),
             float(st.session_state["sample_mount_ty"]),
@@ -1830,6 +2008,14 @@ else:
                 stage_point_traces.append(
                     (mounted_features, feature_labels, "Feature Points (Stage)", "#d62728")
                 )
+            stage_point_traces.append(
+                (
+                    stage_center_stage,
+                    ["Stage Center (Correlated)"],
+                    "Stage Center (Stage Frame)",
+                    "#ffbf00",
+                )
+            )
             render_scene(
                 mounted_mesh,
                 opacity=1.0 - st.session_state["model_transparency"],
@@ -1932,6 +2118,14 @@ else:
                 )
                 transformed_targets = apply_transform(target_points, instrument_pose)
                 instrument_extra_meshes = list(stage_extra_meshes)
+                point_traces.append(
+                    (
+                        stage_center_instr,
+                        ["Stage Center"],
+                        "Stage Center (Instrument)",
+                        "#ffbf00",
+                    )
+                )
                 if st.session_state.get("beam_show", True):
                     x_points = [transformed_mesh.vectors[:, :, 0].min()]
                     x_points.append(0.0)
